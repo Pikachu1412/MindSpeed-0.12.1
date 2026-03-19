@@ -32,10 +32,11 @@ class MindSpeedTEGroupedLinearGMM(torch.autograd.Function):
     def forward(ctx, input_tensor: torch.Tensor,
                 m_split=None,
                 group_list_type=None,
+                save_original_input=False,
                 ori_weight=None,
                 *weight_input_T) -> torch.Tensor:
-        
-        # Due to ascend gmm kernal k split limitations, we need a tensor m_split, not a tensor List.
+
+        # Due to ascend gmm kernel k split limitations, we need a tensor m_split, not a tensor List.
         # Also can be solved in token_dispatcher.
         if not isinstance(m_split, torch.Tensor):
             ctx.group_list = torch.tensor(m_split, device='npu', dtype=torch.int64)
@@ -45,23 +46,30 @@ class MindSpeedTEGroupedLinearGMM(torch.autograd.Function):
         ctx.group_list_type = group_list_type
         fwd_output = torch_npu.npu_grouped_matmul([input_tensor], weight_T, bias=None, group_list=ctx.group_list,
                                                   split_item=2, group_type=0, group_list_type=ctx.group_list_type)[0]
-        ctx.save_for_backward(input_tensor, *ori_weight)
+        # Store weight Parameters directly on ctx instead of via save_for_backward.
+        # fine_grained_activation_offload installs a global hook that intercepts
+        # save_for_backward; PyTorch's autograd engine always casts the hook's
+        # on_get_saved_tensor return value to a plain Tensor, stripping nn.Parameter
+        # attributes like 'main_grad'.  Bypassing the hook for weights avoids this.
+        ctx.save_for_backward(input_tensor)
+        ctx.ori_weight = list(ori_weight) if ori_weight is not None else []
+        ctx.save_original_input = save_original_input
         return fwd_output
 
-    @staticmethod  
+    @staticmethod
     def backward(ctx, grad_output):
-
         group_list = ctx.group_list
         inp = ctx.saved_tensors[0]
-        weight = ctx.saved_tensors[1:]
+        weight = ctx.ori_weight
         group_list_type = ctx.group_list_type
         grad = torch_npu.npu_grouped_matmul([grad_output], weight, bias=None, group_list=group_list,
                                             split_item=2, group_type=0, group_list_type=group_list_type)[0]
-        # K spilt gmm.
+        # K split gmm.
         grad_weight = torch_npu.npu_grouped_matmul([inp.T], [grad_output], bias=None, group_list=group_list,
-                                    split_item=3, group_type=2, group_list_type=group_list_type)[0]
-        
-        return grad, None, None, None, *grad_weight
+                                                   split_item=3, group_type=2, group_list_type=group_list_type)[0]
+
+        # Returns: grad for (input_tensor, m_split, group_list_type, save_original_input, ori_weight, *weight_input_T)
+        return grad, None, None, None, None, *grad_weight
 
 
 class MindSpeedTEGroupedLinearMXFP8GMM(MXFP8GMMFunction):
@@ -95,6 +103,7 @@ class MindSpeedTEGroupedLinear(torch.nn.Module):
         super().__init__()
         self.num_gemms = num_gemms
         self.config = config
+        self.save_original_input = False
         self.te_return_bias = skip_bias_add and bias
         self.is_first_microbatch = True
         self.use_bias = bias
@@ -160,8 +169,8 @@ class MindSpeedTEGroupedLinear(torch.nn.Module):
                 else:
                     w = w.view(-1, self.config.hidden_size)
             self.total_weight_T = [w.T for w in self.total_weight]
-            output = MindSpeedTEGroupedLinearGMM.apply(x, m_splits, group_list_type, self.total_weight,
-                                                       *self.total_weight_T)
+            output = MindSpeedTEGroupedLinearGMM.apply(x, m_splits, group_list_type, self.save_original_input,
+                                                       self.total_weight, *self.total_weight_T)
         else:
             if self.parallel_mode == 'column':
                 weight = [w.view(self.config.hidden_size, -1) for w in self.total_weight]

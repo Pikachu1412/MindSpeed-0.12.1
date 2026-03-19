@@ -27,8 +27,11 @@ class RequirementsBasicFeature(MindSpeedFeature):
         self.optimizer_selection(patch_manager, args)
 
     def te_adaptation(self, pm, args):
-        from mindspeed.core.megatron_basic.requirements_basic import version_wrapper, dummy_compile
+        from mindspeed.core.megatron_basic.requirements_basic import (
+            version_wrapper, dummy_compile,
+        )
         from mindspeed.te.pytorch.module.layernorm import MindSpeedTELayernorm
+        import mindspeed.te.pytorch.cpu_offload_v1 as _cpu_offload_v1
         pm.register_patch('torch.compile', dummy_compile)
         pm.register_patch('torch.jit.script', dummy_compile)
         # Need replace modules before import megatron
@@ -41,6 +44,48 @@ class RequirementsBasicFeature(MindSpeedFeature):
         pm.register_patch('transformer_engine.pytorch.distributed.CudaRNGStatesTracker', torch.nn.Module, create_dummy=True)
         pm.register_patch('transformer_engine.common.recipe.DelayedScaling', torch.nn.Module, create_dummy=True)
         pm.register_patch('flash_attn.flash_attn_interface.flash_attn_unpadded_func', create_dummy=True)
+        # Register cpu_offload_v1 module directly into sys.modules so that megatron's
+        # fine_grained_activation_offload can import it via:
+        #   from transformer_engine.pytorch import cpu_offload_v1 as cpu_offload
+        # register_patch only does setattr on the parent module, which is not enough for
+        # a submodule import; we must also populate sys.modules with the full dotted path.
+        sys.modules.setdefault('transformer_engine.pytorch.cpu_offload_v1', _cpu_offload_v1)
+        sys.modules.setdefault('transformer_engine.pytorch.cpu_offload', _cpu_offload_v1)
+
+    def register_patches(self, pm, args):
+        # Weight Parameters must not enter the fine_grained_activation_offload hook system.
+        # PyTorch's _push_saved_tensors_default_hooks on_get_saved_tensor return value is
+        # always cast to a plain Tensor by the autograd engine — even if we return the
+        # original Parameter, ctx.saved_tensors yields a detached Tensor that has lost
+        # 'main_grad' and other Parameter attributes.
+        #
+        # The only correct fix is to prevent weight Parameters from going through
+        # save_for_backward at all.  We patch the forward/backward of every
+        # autograd.Function that calls ctx.save_for_backward(input, weight):
+        #   - megatron's LinearWithGradAccumulationAndAsyncCommunication
+        #   - MindSpeed's MoE LinearWithGradAccumulationAndAsyncCommunication
+        #   - MindSpeed's TE linear Functions (linear.py) — handled separately
+        #   - MindSpeed's grouped_linear.py — handled separately
+        from mindspeed.core.megatron_basic.requirements_basic import (
+            linear_with_grad_accum_forward_wrapper,
+            linear_with_grad_accum_backward_wrapper,
+        )
+        pm.register_patch(
+            'megatron.core.tensor_parallel.layers.LinearWithGradAccumulationAndAsyncCommunication.forward',
+            linear_with_grad_accum_forward_wrapper,
+        )
+        pm.register_patch(
+            'megatron.core.tensor_parallel.layers.LinearWithGradAccumulationAndAsyncCommunication.backward',
+            linear_with_grad_accum_backward_wrapper,
+        )
+        pm.register_patch(
+            'mindspeed.core.transformer.moe.layers.LinearWithGradAccumulationAndAsyncCommunication.forward',
+            linear_with_grad_accum_forward_wrapper,
+        )
+        pm.register_patch(
+            'mindspeed.core.transformer.moe.layers.LinearWithGradAccumulationAndAsyncCommunication.backward',
+            linear_with_grad_accum_backward_wrapper,
+        )
 
     def apex_adaptation(self, pm, args):
         from mindspeed.core.megatron_basic.requirements_basic import multi_tensor_l2norm, multi_tensor_scale, multi_tensor_applier

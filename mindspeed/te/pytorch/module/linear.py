@@ -52,6 +52,7 @@ class TEColumnParallelLinear(torch.nn.Module):
 
         super(TEColumnParallelLinear, self).__init__()
         self.fp8_meta = FP8Metadata()
+        self.save_original_input = False
 
         # Keep input parameters
         self.input_size = input_size
@@ -179,9 +180,9 @@ class TEColumnParallelLinear(torch.nn.Module):
         elif self.explicit_expert_comm:
             output = input_.matmul(weight.t())
         elif self.sequence_parallel:
-            output = ColumnParallelSeq.apply(input_, weight, bias, self.fp8_meta)
+            output = ColumnParallelSeq.apply(input_, weight, bias, self.fp8_meta, self.save_original_input)
         else:
-            output = ColumnParallelNoSeq.apply(input_, weight, bias, self.fp8_meta)
+            output = ColumnParallelNoSeq.apply(input_, weight, bias, self.fp8_meta, self.save_original_input)
 
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
@@ -203,7 +204,7 @@ class TEColumnParallelLinear(torch.nn.Module):
 
 class ColumnParallelSeq(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input_, weight, bias, fp8_meta: FP8Metadata):
+    def forward(ctx, input_, weight, bias, fp8_meta: FP8Metadata, save_original_input: bool = False):
         ctx.use_bias = bias is not None
         ctx.fp8_meta = fp8_meta
         ctx.fp8_enable = fp8_meta.is_fp8_enable()
@@ -217,7 +218,11 @@ class ColumnParallelSeq(torch.autograd.Function):
             ctx.total_input = total_input
 
         if ctx.fp8_enable:
-            save_xw_for_backword(ctx, None, weight_fp8)
+            # When save_original_input is True, save the original input tensor instead of None,
+            # so that forced_released_tensors=[input_] can safely resize_(0) the GPU memory
+            # after D2H offload without corrupting the split-view tensors being D2H copied.
+            saved_input = input_ if save_original_input else None
+            save_xw_for_backword(ctx, saved_input, weight_fp8)
         else:
             save_xw_for_backword(ctx, input_, weight)
         ctx.input_size = input_.size()
@@ -259,22 +264,28 @@ class ColumnParallelSeq(torch.autograd.Function):
         grad_weight, grad_bias = calculate_grad(ctx, total_input, weight, grad_output, grad_output_ori)
 
         reduce_scatter_handle.wait()
-        return sub_grad_input, grad_weight, grad_bias, None
+        # Returns: grad for (input_, weight, bias, fp8_meta, save_original_input)
+        return sub_grad_input, grad_weight, grad_bias, None, None
 
 
 class ColumnParallelNoSeq(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input_, weight, bias, fp8_meta: FP8Metadata):
+    def forward(ctx, input_, weight, bias, fp8_meta: FP8Metadata, save_original_input: bool = False):
         ctx.use_bias = bias is not None
         ctx.fp8_meta = fp8_meta
         ctx.fp8_enable = fp8_meta.is_fp8_enable()
         ctx.gradient_accumulation_fusion = get_args().gradient_accumulation_fusion
+        original_input = input_
         if fp8_meta is None or not fp8_meta.is_fp8_enable():
             output = torch.matmul(input_, weight.t())
         else:
             output, input_, weight = fp8_matmul(input_, weight, fp8_meta, MatmulKey.forward)
 
-        save_xw_for_backword(ctx, input_, weight)
+        # When save_original_input is True, save the original input tensor (not the fp8-quantized
+        # version) so that forced_released_tensors=[input_] can safely resize_(0) the GPU memory
+        # after D2H offload without corrupting the split-view tensors being D2H copied.
+        saved_input = original_input if save_original_input else input_
+        save_xw_for_backword(ctx, saved_input, weight)
 
         if bias is not None:
             output = output + bias
@@ -301,7 +312,8 @@ class ColumnParallelNoSeq(torch.autograd.Function):
         # 在计算之后等待
         handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None
+        # Returns: grad for (input_, weight, bias, fp8_meta, save_original_input)
+        return grad_input, grad_weight, grad_bias, None, None
 
 
 class TERowParallelLinear(torch.nn.Module):
@@ -327,6 +339,7 @@ class TERowParallelLinear(torch.nn.Module):
 
         super(TERowParallelLinear, self).__init__()
         self.fp8_meta = FP8Metadata()
+        self.save_original_input = False
 
         # Keep input parameters
         self.input_size = input_size
@@ -426,9 +439,9 @@ class TERowParallelLinear(torch.nn.Module):
         elif self.explicit_expert_comm:
             output = input_.matmul(self.weight.t())
         elif self.sequence_parallel:
-            output = RowParallelSeq.apply(input_, self.weight, None, self.fp8_meta)
+            output = RowParallelSeq.apply(input_, self.weight, None, self.fp8_meta, self.save_original_input)
         else:
-            output = RowParallelNoSeq.apply(input_, self.weight, None, self.fp8_meta)
+            output = RowParallelNoSeq.apply(input_, self.weight, None, self.fp8_meta, self.save_original_input)
 
         if not self.skip_bias_add:
             output = (output + self.bias) if self.bias is not None else output
@@ -455,15 +468,20 @@ class TERowParallelLinear(torch.nn.Module):
 
 class RowParallelSeq(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input_, weight, bias, fp8_meta: FP8Metadata):
+    def forward(ctx, input_, weight, bias, fp8_meta: FP8Metadata, save_original_input: bool = False):
         ctx.use_bias = bias is not None
         ctx.fp8_meta = fp8_meta
         ctx.fp8_enable = fp8_meta.is_fp8_enable()
         ctx.gradient_accumulation_fusion = get_args().gradient_accumulation_fusion
+        original_input = input_
         output_parallel, input_, weight = get_ops().matmul_reduce_scatter(input_, weight, bias,
                                                                           fp8_meta, MatmulKey.forward,
                                                                           ctx.fp8_enable)
-        save_xw_for_backword(ctx, input_, weight)
+        # When save_original_input is True, save the original input tensor (not the fp8-quantized
+        # version) so that forced_released_tensors=[input_] can safely resize_(0) the GPU memory
+        # after D2H offload without corrupting the split-view tensors being D2H copied.
+        saved_input = original_input if save_original_input else input_
+        save_xw_for_backword(ctx, saved_input, weight)
 
         return output_parallel
 
@@ -475,20 +493,25 @@ class RowParallelSeq(torch.autograd.Function):
         grad_input, grad_output, _ = get_ops().allgather_matmul(grad_output, weight, None, ctx.fp8_meta,
                                                                 MatmulKey.dx, ctx.fp8_enable)
         grad_weight, grad_bias = calculate_grad(ctx, input_, weight, grad_output, grad_output_ori)
-        return grad_input, grad_weight, grad_bias, None
+        # Returns: grad for (input_, weight, bias, fp8_meta, save_original_input)
+        return grad_input, grad_weight, grad_bias, None, None
 
 
 class RowParallelNoSeq(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input_, weight, bias, fp8_meta: FP8Metadata):
+    def forward(ctx, input_, weight, bias, fp8_meta: FP8Metadata, save_original_input: bool = False):
         ctx.use_bias = bias is not None
         ctx.fp8_meta = fp8_meta
         ctx.fp8_enable = fp8_meta.is_fp8_enable()
         ctx.gradient_accumulation_fusion = get_args().gradient_accumulation_fusion
-
+        original_input = input_
         output_, input_, weight = get_ops().matmul_all_reduce(input_, weight, bias, fp8_meta,
                                                               MatmulKey.forward, ctx.fp8_enable)
-        save_xw_for_backword(ctx, input_, weight)
+        # When save_original_input is True, save the original input tensor (not the fp8-quantized
+        # version) so that forced_released_tensors=[input_] can safely resize_(0) the GPU memory
+        # after D2H offload without corrupting the split-view tensors being D2H copied.
+        saved_input = original_input if save_original_input else input_
+        save_xw_for_backword(ctx, saved_input, weight)
         return output_
 
     @staticmethod
@@ -501,7 +524,8 @@ class RowParallelNoSeq(torch.autograd.Function):
             grad_input, grad_output, _ = fp8_matmul(grad_output, weight, ctx.fp8_meta, MatmulKey.dx)
 
         grad_weight, grad_bias = calculate_grad(ctx, input_, weight, grad_output, grad_output_ori)
-        return grad_input, grad_weight, grad_bias, None
+        # Returns: grad for (input_, weight, bias, fp8_meta, save_original_input)
+        return grad_input, grad_weight, grad_bias, None, None
 
 
 def async_gather_along_first_dim(input_, group, world_size):
@@ -513,7 +537,10 @@ def async_gather_along_first_dim(input_, group, world_size):
 
 
 def calculate_grad(ctx, inp, weight, grad, ori_grad):
-    _, is_grad_weight_needed, is_grad_bias_needed, _ = ctx.needs_input_grad
+    # needs_input_grad corresponds to forward args: (input_, weight, bias, fp8_meta, save_original_input)
+    # fp8_meta and save_original_input are non-tensor args so their grad flags are always False,
+    # but we use *_ to be safe regardless of how many non-tensor args are appended.
+    _, is_grad_weight_needed, is_grad_bias_needed, *_ = ctx.needs_input_grad
     grad_weight, grad_bias = None, None
 
     # calculate_grad_weight
@@ -560,26 +587,38 @@ def calculate_grad(ctx, inp, weight, grad, ori_grad):
 
 
 def save_xw_for_backword(ctx, input_, weight):
+    """Save input and weight for backward pass.
+
+    Weight is stored directly on ctx (not via save_for_backward) so that it
+    bypasses the fine_grained_activation_offload hook system.  PyTorch's
+    _push_saved_tensors_default_hooks always casts the on_get_saved_tensor
+    return value to a plain Tensor, which would strip nn.Parameter attributes
+    like 'main_grad' that gradient_accumulation_fusion requires.
+
+    For the fp8 path, both tensors are already plain Tensors (quantized copies),
+    so they are stored directly on ctx as before.
+    """
     if ctx.fp8_enable:
         ctx.input_fp8 = input_
         ctx.weight_fp8 = weight
-    elif ctx.gradient_accumulation_fusion:
-        ctx.save_for_backward(input_)
-        ctx.weight = weight
     else:
-        ctx.save_for_backward(input_, weight)
+        if input_ is not None:
+            ctx.save_for_backward(input_)
+        else:
+            ctx._saved_input_is_none = True
+        ctx.weight = weight
 
 
 def load_xw_from_forward(ctx):
+    """Load input and weight saved by save_xw_for_backword."""
     if ctx.fp8_enable:
-        input_ = ctx.input_fp8
-        weight = ctx.weight_fp8
-    elif ctx.gradient_accumulation_fusion:
-        input_ = ctx.saved_tensors[0]
-        weight = ctx.weight
+        return ctx.input_fp8, ctx.weight_fp8
     else:
-        input_, weight = ctx.saved_tensors
-    return input_, weight
+        if getattr(ctx, '_saved_input_is_none', False):
+            input_ = None
+        else:
+            input_ = ctx.saved_tensors[0]
+        return input_, ctx.weight
 
 
 def reshape_to_2D(input_tensor):

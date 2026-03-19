@@ -98,3 +98,103 @@ def dummy_compile(*args, **kwargs):
                 return fn(*fn_args, **fn_kwargs)
             return wrapper
         return compile_wrapper
+
+
+def linear_with_grad_accum_forward_wrapper(fn):
+    """Wrapper for LinearWithGradAccumulationAndAsyncCommunication.forward.
+
+    The fine_grained_activation_offload feature installs a global hook via
+    torch._C._autograd._push_saved_tensors_default_hooks that intercepts every
+    ctx.save_for_backward call.  When weight (an nn.Parameter) is passed to
+    save_for_backward, the hook offloads it to CPU and returns a plain Tensor on
+    retrieval — losing custom attributes like 'main_grad' that
+    gradient_accumulation_fusion requires.
+
+    PyTorch's autograd engine always casts the on_get_saved_tensor return value
+    to a plain Tensor, so there is no way to recover the Parameter type inside
+    the hook.  The only correct fix is to keep weight out of save_for_backward
+    entirely: store it directly on ctx so it bypasses the hook system.
+
+    Strategy: shadow ctx.save_for_backward with a Python-level instance attribute
+    that filters out the weight tensor before delegating to the real C++ method.
+    Python attribute lookup checks instance __dict__ before the type's C-level
+    descriptors, so this shadowing works reliably.
+    """
+    @wraps(fn)
+    def wrapper(ctx, input, weight, *args, **kwargs):
+        _real_save = ctx.save_for_backward
+
+        def _save_without_weight(*tensors):
+            # Filter out the weight Parameter; save only the remaining tensors
+            # (typically just `input`) through the normal hook-intercepted path.
+            filtered = tuple(t for t in tensors if t is not weight)
+            _real_save(*filtered)
+            # Store weight directly on ctx, bypassing the offload hook system.
+            ctx.weight = weight
+
+        # Shadow the C++ method with our Python function at the instance level.
+        ctx.save_for_backward = _save_without_weight
+        try:
+            result = fn(ctx, input, weight, *args, **kwargs)
+        finally:
+            # Remove the shadow so ctx is clean for any subsequent use.
+            try:
+                del ctx.save_for_backward
+            except AttributeError:
+                pass
+        return result
+    return wrapper
+
+
+def linear_with_grad_accum_backward_wrapper(fn):
+    """Wrapper for LinearWithGradAccumulationAndAsyncCommunication.backward.
+
+    Retrieves weight from ctx.weight (set by the patched forward) instead of
+    ctx.saved_tensors, so that all Parameter attributes (main_grad, allreduce,
+    grad_added_to_main_grad, zero_out_wgrad, etc.) are intact.
+
+    Strategy: the original backward does ``input, weight = ctx.saved_tensors``.
+    Since we only saved `input` via save_for_backward, ctx.saved_tensors is a
+    1-tuple.  We unpack it ourselves and pass the real weight from ctx.weight,
+    then call the original backward body directly — avoiding any need to mutate
+    the read-only saved_tensors property.
+    """
+    @wraps(fn)
+    def wrapper(ctx, grad_output):
+        if not hasattr(ctx, 'weight'):
+            # Patch not active (e.g. fine_grained_activation_offload disabled);
+            # fall through to the original backward unchanged.
+            return fn(ctx, grad_output)
+
+        # Reconstruct the (input, weight) pair the original backward expects.
+        weight = ctx.weight
+        (input,) = ctx.saved_tensors  # only input was saved via save_for_backward
+
+        # saved_tensors is a C-level *data* descriptor (has __set__), which takes
+        # priority over instance __dict__, so we cannot shadow it with a plain
+        # instance attribute.  Use a shim object that exposes saved_tensors as a
+        # Python @property returning (input, weight).
+        _combined = (input, weight)
+
+        class _CtxShim:
+            """Minimal shim exposing saved_tensors as (input, weight)."""
+            __slots__ = ('_real',)
+
+            def __init__(self, real_ctx):
+                object.__setattr__(self, '_real', real_ctx)
+
+            @property
+            def saved_tensors(self):
+                return _combined
+
+            def __getattr__(self, name):
+                return getattr(object.__getattribute__(self, '_real'), name)
+
+            def __setattr__(self, name, value):
+                if name == '_real':
+                    object.__setattr__(self, name, value)
+                else:
+                    setattr(object.__getattribute__(self, '_real'), name, value)
+
+        return fn(_CtxShim(ctx), grad_output)
+    return wrapper

@@ -75,6 +75,7 @@ class MindSpeedTELayerNormColumnParallelLinear(torch.nn.Module):
 
         super(MindSpeedTELayerNormColumnParallelLinear, self).__init__()
         self.config = config
+        self.save_original_input = False
         self.input_size = input_size
         self.output_size = output_size
         self.gather_output = gather_output
