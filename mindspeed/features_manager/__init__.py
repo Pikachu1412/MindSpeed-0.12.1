@@ -95,6 +95,9 @@ from mindspeed.features_manager.transformer.multi_head_latent_attention.mla_feat
 from mindspeed.features_manager.transformer.experimental_attention_variant.dsa import DeepSeekSparseAttention
 
 from mindspeed.features_manager.tensor_parallel.vocab_parallel import ReplaceIndexPutFeature
+from mindspeed.features_manager.tensor_parallel.streamed_vocab_parallel_cross_entropy import (
+    StreamedVocabParallelCrossEntropyFeature,
+)
 from mindspeed.features_manager.distributed.layerzero import LayerZeroFeature
 from mindspeed.features_manager.optimizer.swap_optimizer_feature import SwapOptimizerFeature
 from mindspeed.features_manager.optimizer.low_precision_optimizer_feature import LowPrecisionOptimizerFeature
@@ -185,7 +188,8 @@ def add_tensor_parallel_features(features_list: List[MindSpeedFeature]):
         MC2Feature(),
         CoCFeature(),
         TP2dFeature(),
-        ReplaceIndexPutFeature()
+        ReplaceIndexPutFeature(),
+        StreamedVocabParallelCrossEntropyFeature()
     ])
 
 
