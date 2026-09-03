@@ -42,6 +42,10 @@ class StreamedVocabParallelCrossEntropyFeature(MindSpeedFeature):
             raise AssertionError(
                 "streamed vocab-parallel cross entropy does not support config logging"
             )
+        if getattr(args, "unaligned_linear", False):
+            raise AssertionError(
+                "streamed vocab-parallel cross entropy does not support unaligned linear"
+            )
         if getattr(args, "cross_entropy_loss_fusion", False):
             raise AssertionError(
                 "streamed vocab-parallel cross entropy and cross-entropy fusion are incompatible"

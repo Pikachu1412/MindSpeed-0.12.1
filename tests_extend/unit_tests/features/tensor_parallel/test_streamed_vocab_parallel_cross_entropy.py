@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from mindspeed import megatron_adaptor
+from mindspeed.core.tensor_parallel import streamed_vocab_parallel_cross_entropy as streamed_ce
 from mindspeed.core.tensor_parallel.streamed_vocab_parallel_cross_entropy import (
     streamed_vocab_parallel_cross_entropy,
 )
@@ -81,6 +82,73 @@ class TestStreamedVocabParallelCrossEntropy(DistributedTest):
             streamed_weight.grad, reference_weight.grad, atol=tolerance, rtol=tolerance
         )
         parallel_state.destroy_model_parallel()
+
+    def test_backward_reuses_forward_statistics(self):
+        initialize_model_parallel(2, 1)
+        torch.manual_seed(2027)
+        sequence_length, batch_size, hidden_size = 9, 3, 32
+        vocab_size = 256
+        labels = torch.randint(0, vocab_size, (batch_size, sequence_length), device="npu")
+        hidden = 0.1 * torch.randn(
+            sequence_length, batch_size, hidden_size,
+            device="npu", dtype=torch.bfloat16, requires_grad=True
+        )
+        weight = 0.1 * torch.randn(
+            vocab_size // 2, hidden_size,
+            device="npu", dtype=torch.bfloat16, requires_grad=True
+        )
+        grad_output = torch.randn(batch_size, sequence_length, device="npu")
+
+        original_batched_statistics = streamed_ce._batched_statistics
+        call_count = 0
+
+        def counted_batched_statistics(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return original_batched_statistics(*args, **kwargs)
+
+        streamed_ce._batched_statistics = counted_batched_statistics
+        try:
+            loss = streamed_vocab_parallel_cross_entropy(hidden, weight, labels, 7)
+            assert call_count == 1
+            (loss * grad_output).sum().backward()
+            assert call_count == 1
+        finally:
+            streamed_ce._batched_statistics = original_batched_statistics
+            parallel_state.destroy_model_parallel()
+
+    def test_aligned_chunks_use_one_backward_kernel(self):
+        initialize_model_parallel(2, 1)
+        torch.manual_seed(2028)
+        sequence_length, batch_size, hidden_size = 9, 3, 32
+        vocab_size = 256
+        labels = torch.randint(0, vocab_size, (batch_size, sequence_length), device="npu")
+        hidden = 0.1 * torch.randn(
+            sequence_length, batch_size, hidden_size,
+            device="npu", dtype=torch.bfloat16, requires_grad=True
+        )
+        weight = 0.1 * torch.randn(
+            vocab_size // 2, hidden_size,
+            device="npu", dtype=torch.bfloat16, requires_grad=True
+        )
+        grad_output = torch.randn(batch_size, sequence_length, device="npu")
+
+        original_backward = streamed_ce.torch_npu.fused_linear_cross_entropy_loss_with_max_sum_grad
+        call_count = 0
+
+        def counted_backward(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return original_backward(*args, **kwargs)
+
+        streamed_ce.torch_npu.fused_linear_cross_entropy_loss_with_max_sum_grad = counted_backward
+        try:
+            loss = streamed_vocab_parallel_cross_entropy(hidden, weight, labels, 8)
+            (loss * grad_output).sum().backward()
+            assert call_count == 1
+        finally:
+            streamed_ce.torch_npu.fused_linear_cross_entropy_loss_with_max_sum_grad = original_backward
+            parallel_state.destroy_model_parallel()
 
     def test_sequence_parallel_matches_reference(self):
         initialize_model_parallel(2, 1)
@@ -190,6 +258,27 @@ def test_feature_validation():
         "mtp_num_layers": None,
     })()
     with pytest.raises(AssertionError, match="chunk size must be positive"):
+        feature.validate_args(args)
+
+
+def test_feature_validation_rejects_unaligned_linear():
+    feature = StreamedVocabParallelCrossEntropyFeature()
+    args = type("Args", (), {
+        "use_streamed_vocab_parallel_cross_entropy": True,
+        "streamed_vocab_parallel_cross_entropy_chunk_size": 128,
+        "fp16": False,
+        "bf16": True,
+        "deterministic_mode": False,
+        "npu_deterministic": False,
+        "label_smoothing": 0.0,
+        "config_logger_dir": "",
+        "unaligned_linear": True,
+        "cross_entropy_loss_fusion": False,
+        "gradient_accumulation_fusion": False,
+        "defer_embedding_wgrad_compute": False,
+        "mtp_num_layers": None,
+    })()
+    with pytest.raises(AssertionError, match="does not support unaligned linear"):
         feature.validate_args(args)
 
 

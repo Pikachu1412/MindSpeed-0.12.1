@@ -114,7 +114,7 @@ def _batched_statistics(input_, weight, target, chunk_size, vocab_start_index, v
     _all_reduce(reduced, torch.distributed.ReduceOp.SUM)
     return (
         global_logits_max,
-        reduced[0],
+        reduced[0].clone(),
         reduced[1],
         target_mask_chunks,
         masked_target_chunks,
@@ -147,36 +147,51 @@ class _StreamedVocabParallelCrossEntropy(torch.autograd.Function):
             statistics[0], statistics[1], statistics[2]
         )
 
-        ctx.save_for_backward(hidden_states, weight, target)
         ctx.chunk_size = chunk_size
-        ctx.vocab_start_index = vocab_start_index
-        ctx.vocab_end_index = vocab_end_index
+        ctx.all_token_backward = chunk_size % 8 == 0
+        if ctx.all_token_backward:
+            ctx.save_for_backward(
+                hidden_states, weight, statistics[0], statistics[1],
+                torch.cat(statistics[3]), torch.cat(statistics[4])
+            )
+        else:
+            ctx.save_for_backward(
+                hidden_states, weight, statistics[0], statistics[1],
+                *statistics[3], *statistics[4]
+            )
+            ctx.num_chunks = len(statistics[3])
         return losses.view_as(target)
 
     @staticmethod
     def backward(ctx, grad_output):
-        hidden_states, weight, target = ctx.saved_tensors
+        hidden_states, weight, logits_max, sum_exp_logits, *chunk_metadata = ctx.saved_tensors
         flat_hidden = hidden_states.reshape(-1, hidden_states.size(-1))
-        flat_target = target.reshape(-1)
         flat_grad_output = grad_output.reshape(-1).float()
-        grad_input = torch.empty_like(flat_hidden)
-        grad_weight = torch.zeros_like(weight)
 
-        statistics = _batched_statistics(
-            flat_hidden, weight, flat_target, ctx.chunk_size,
-            ctx.vocab_start_index, ctx.vocab_end_index
-        )
-        for index, start in enumerate(range(0, flat_target.numel(), ctx.chunk_size)):
-            end = min(start + ctx.chunk_size, flat_target.numel())
-            chunk_grad_input, chunk_grad_weight = (
+        if ctx.all_token_backward:
+            grad_input, grad_weight = (
                 torch_npu.fused_linear_cross_entropy_loss_with_max_sum_grad(
-                    flat_grad_output[start:end], flat_hidden[start:end], weight,
-                    statistics[3][index], statistics[4][index], 0.0,
-                    statistics[0][start:end], statistics[1][start:end], None
+                    flat_grad_output, flat_hidden, weight,
+                    chunk_metadata[0], chunk_metadata[1], 0.0,
+                    logits_max, sum_exp_logits, None
                 )
             )
-            grad_input[start:end].copy_(chunk_grad_input)
-            grad_weight.add_(chunk_grad_weight)
+        else:
+            target_masks = chunk_metadata[:ctx.num_chunks]
+            masked_targets = chunk_metadata[ctx.num_chunks:]
+            grad_input = torch.empty_like(flat_hidden)
+            grad_weight = torch.zeros_like(weight)
+            for index, start in enumerate(range(0, flat_grad_output.numel(), ctx.chunk_size)):
+                end = min(start + ctx.chunk_size, flat_grad_output.numel())
+                chunk_grad_input, chunk_grad_weight = (
+                    torch_npu.fused_linear_cross_entropy_loss_with_max_sum_grad(
+                        flat_grad_output[start:end], flat_hidden[start:end], weight,
+                        target_masks[index], masked_targets[index], 0.0,
+                        logits_max[start:end], sum_exp_logits[start:end], None
+                    )
+                )
+                grad_input[start:end].copy_(chunk_grad_input)
+                grad_weight.add_(chunk_grad_weight)
 
         return (
             grad_input.view_as(hidden_states),
