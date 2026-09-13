@@ -25,34 +25,27 @@ def train_wrapper(train):
         if is_profile:
             global PROFILE_RECORD
             active = args_.profile_step_end - args_.profile_step_start
-            skip_first = args_.profile_step_start
+            wait = max(args_.profile_step_start - 1, 0)
+            warmup = 2 if args_.profile_step_start > 0 else 0
 
-            if args_.profile_with_cpu:
-                activities = [torch_npu.profiler.ProfilerActivity.NPU, torch_npu.profiler.ProfilerActivity.CPU]
-            else:
-                activities = [torch_npu.profiler.ProfilerActivity.NPU]
-
-            level2level = {
-                'level0': torch_npu.profiler.ProfilerLevel.Level0,
-                'level1': torch_npu.profiler.ProfilerLevel.Level1,
-                'level2': torch_npu.profiler.ProfilerLevel.Level2
-            }
-            profiler_level = level2level[args_.profile_level]
-
-            experimental_config = torch_npu.profiler._ExperimentalConfig(
-                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-                profiler_level=profiler_level,
-                l2_cache=False
-            )
+            activities = [
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU
+            ]
 
             with torch_npu.profiler.profile(
                 activities=activities,
-                record_shapes=args_.profile_record_shapes,
-                profile_memory=args_.profile_with_memory,
-                with_stack=args_.profile_with_stack,
-                experimental_config=experimental_config,
-                schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=active, repeat=1, skip_first=skip_first),
-                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(args_.profile_save_path)
+                schedule=torch_npu.profiler.schedule(
+                    wait=wait,
+                    warmup=warmup,
+                    active=active,
+                    repeat=1),
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(args_.tensorboard_dir),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+                with_modules=True,
+                with_flops=True
             ) as prof:
                 PROFILE_RECORD = prof
                 return train(*args, **kwargs)
@@ -66,7 +59,7 @@ def train_step_wrapper(train_step):
     def wrapper(*args, **kwargs):
         args_ = get_full_args()
         ret = train_step(*args, **kwargs)
-        is_profile = args_.profile_npu and (
+        is_profile = hasattr(args_, 'profile_npu') and args_.profile_npu and (
                 (torch.distributed.get_rank() in args_.profile_ranks)
                 or (-1 in args_.profile_ranks)
         )

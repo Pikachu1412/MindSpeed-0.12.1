@@ -73,6 +73,7 @@ from mindspeed.features_manager.pipeline_parallel.variable_seq_length import Var
 from mindspeed.features_manager.pipeline_parallel.multi_parameter import MultiParameterFeature
 from mindspeed.features_manager.pipeline_parallel.optimize_send_recv_comm import OptimizeSendRecvCommFeature
 from mindspeed.features_manager.pipeline_parallel.dualpipev_feature import DualpipeVFeature
+from mindspeed.features_manager.memory.adaptive_offload import AdaptiveOffloadFeature
 from mindspeed.features_manager.memory.reuse_fp32_param import ReuseFP32Param
 from mindspeed.features_manager.memory.smart_swap import SmartSwapFeature
 
@@ -286,6 +287,12 @@ def add_reuse_param_features(features_list: List[MindSpeedFeature]):
     ])
 
 
+def add_adaptive_offload_features(features_list: List[MindSpeedFeature]):
+    features_list.extend([
+        AdaptiveOffloadFeature(),
+    ])
+
+
 def add_swap_manage_features(features_list: List[MindSpeedFeature]):
     features_list.extend([
         SmartSwapFeature(),
@@ -361,6 +368,7 @@ def create_features_list():
     add_tokenizer_features(features_list)
     add_distributed_features(features_list)
     add_reuse_param_features(features_list)
+    add_adaptive_offload_features(features_list)
     add_swap_manage_features(features_list)
     add_compress_dense_features(features_list)
     add_compress_memory_feature(features_list)
