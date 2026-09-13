@@ -66,7 +66,7 @@ def forward_attention_wrapper(original_forward_attention):
         )
 
         # Handle deprecated inference_params
-        from megatron.core.transformer.utils import deprecate_inference_params
+        from megatron.core.utils import deprecate_inference_params
         inference_context = deprecate_inference_params(
             inference_context, inference_params
         )

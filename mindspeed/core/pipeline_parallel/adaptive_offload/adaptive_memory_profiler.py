@@ -502,66 +502,166 @@ class OffloadRecomputeOptimizer:
                 "sample_count": stats.sample_count,
             }
 
-        # --- Phase 2: Coupled-group-aware decisions ---
-        # For coupled groups (attention sub-groups, MoE sub-groups), compute
-        # aggregate metrics and make a single decision for the entire set.
+        # --- Phase 2: PCIe time budget — pick FORCED-OFFLOAD set ---
+        # The fundamental constraint on offloading is PCIe bandwidth: the total
+        # H2D time of the OFFLOAD set per layer must be ≤ the layer's backward
+        # compute time (otherwise stall accumulates and offload is net-negative).
         #
-        # Decision priority (v3):
-        #   1. All stalls < threshold → OFFLOAD (well overlapped, no action needed)
-        #   2. KEEP if memory budget allows (zero recompute overhead, pure win)
-        #   3. RECOMPUTE if net_benefit > 0 (stall saved > recompute cost)
-        #   4. OFFLOAD otherwise (accept the stall, cheaper than recompute)
+        # Strategy: greedily pack the LARGEST groups into the PCIe budget so we
+        # OFFLOAD the activations that yield the most memory saving per layer
+        # while keeping H2D time hidable.  Remaining groups are candidates for
+        # KEEP / RECOMPUTE in Phase 3-4.
         #
-        # Previous logic (v2) prioritized RECOMPUTE over KEEP, causing large
-        # groups like expert_fc1+moe_act to be recomputed even when 50+ GB of
-        # GPU memory was sitting idle.  v3 fixes this by treating KEEP as the
-        # preferred option whenever the memory budget permits.
-        def _decide_coupled_group(
-            coupled_set: Set[str],
-            metrics: Dict[str, Dict],
-        ) -> Dict[str, str]:
-            """Decide strategy for a coupled group as a unit."""
-            active_in_set = [g for g in coupled_set if g in metrics]
-            if not active_in_set:
-                return {}
+        # Notes
+        # -----
+        # - h2d_gbps is from the measured PCIe stats (real-world).  If it is 0
+        #   we fall back to legacy stall-threshold behavior.
+        # - The budget is shared across coupled groups: choosing one member of
+        #   a coupled set forces the whole set in (since recompute wraps the
+        #   whole module — partial coupled-set offload changes nothing).
+        pcie_budget_ratio = float(
+            os.environ.get("ADAPTIVE_OFFLOAD_PCIE_BUDGET_RATIO", "0.8")
+        )
+        pcie_budget_enabled = (
+            os.environ.get("ADAPTIVE_OFFLOAD_PCIE_BUDGET", "1") == "1"
+            and h2d_gbps > 0
+        )
 
-            # Aggregate: total stall saved by not offloading the entire set,
-            # and total recompute cost if the entire set is recomputed.
-            total_stall = sum(metrics[g]["stall_ms"] for g in active_in_set)
-            total_recompute = sum(metrics[g]["recompute_ms"] for g in active_in_set)
-            total_mem_mb = sum(metrics[g]["offload_mb"] for g in active_in_set)
+        forced_offload: Set[str] = set()
+        forced_keep: Set[str] = set()
+        per_group_pcie_ms: Dict[str, float] = {}
+        pcie_budget_ms = 0.0
 
-            # All stalls below threshold → OFFLOAD (well overlapped)
-            all_low_stall = all(
-                metrics[g]["stall_ms"] <= self._stall_threshold_ms
-                for g in active_in_set
+        # Fast path: if the memory budget is large enough to KEEP every group
+        # *under 1F1B-style microbatch concurrency*, do so unconditionally —
+        # there is no point spending PCIe bandwidth to offload anything when
+        # activations comfortably fit on the GPU.  This is the typical case at
+        # small micro-batch sizes (MBS=1) where the measured stalls are
+        # already in the "everything KEEP" regime.
+        #
+        # 1F1B keeps roughly ``pp_world_size`` microbatches in flight on the
+        # earliest PP stage (PP rank 0), so the effective KEEP memory is
+        #     keep_per_layer × num_layers × pp_world_size.
+        # If we don't account for this multiplier, fast-path KEEP all easily
+        # OOMs at MBS≥2.
+        try:
+            from megatron.core import parallel_state as _ps
+            _pp_ws = _ps.get_pipeline_model_parallel_world_size()
+        except Exception:
+            _pp_ws = max(self._pp_world_size if hasattr(self, "_pp_world_size") else 1, 1)
+        per_layer_keep_mb = sum(m["offload_mb"] for m in group_metrics.values())
+        total_keep_mem_mb = (
+            per_layer_keep_mb * max(self._num_layers, 1) * max(_pp_ws, 1)
+        )
+        memory_fits_all = (
+            self._memory_budget_mb > 0
+            and total_keep_mem_mb <= self._memory_budget_mb
+        )
+
+        if memory_fits_all:
+            for g in group_metrics:
+                forced_keep.add(g)
+            analysis_lines.append(
+                f"  [MEM fits all] total_keep={total_keep_mem_mb:.1f}MB "
+                f"(per_layer={per_layer_keep_mb:.1f}MB × layers={self._num_layers} "
+                f"× pp_ws={_pp_ws}) <= budget={self._memory_budget_mb:.0f}MB  "
+                f"→ KEEP every group, skip PCIe budget"
             )
-            if all_low_stall:
-                return {g: "OFFLOAD" for g in active_in_set}
+        elif pcie_budget_enabled:
+            total_bwd_per_layer = sum(
+                m["bwd_compute_ms"] for m in group_metrics.values()
+            )
+            pcie_budget_ms = max(0.0, total_bwd_per_layer * pcie_budget_ratio)
+            for g, m in group_metrics.items():
+                # MB → GB → seconds → ms
+                per_group_pcie_ms[g] = (
+                    (m["offload_mb"] / 1024.0) / h2d_gbps * 1000.0
+                )
+            # Group atomically by coupled-set so the greedy never produces
+            # partial coupled selections (a partial coupled OFFLOAD would
+            # forces a full-set promotion later, blowing past the budget).
+            #
+            # Each "unit" is a list of group names that must move as a block.
+            units: List[Tuple[Tuple[str, ...], float, float]] = []
+            seen: Set[str] = set()
+            for coupled in (_ATTN_COUPLED, _MOE_COUPLED):
+                active = tuple(g for g in coupled if g in group_metrics)
+                if active:
+                    unit_pcie = sum(per_group_pcie_ms[g] for g in active)
+                    unit_mb = sum(group_metrics[g]["offload_mb"] for g in active)
+                    units.append((active, unit_pcie, unit_mb))
+                    seen.update(active)
+            for g in group_metrics:
+                if g not in seen:
+                    units.append(((g,), per_group_pcie_ms[g], group_metrics[g]["offload_mb"]))
 
-            # Any stall above threshold → needs intervention (KEEP or RECOMPUTE).
-            # KEEP is always better in terms of time (zero recompute overhead),
-            # so prefer KEEP.  Memory budget enforcement is in Phase 4.
-            return {g: "KEEP" for g in active_in_set}
+            # Pack largest-by-size unit first.  Memory/PCIe ratio is the same
+            # for every group (== h2d_bw), so any subset filling the budget
+            # gives the same total bytes saved; picking the largest unit first
+            # minimises the number of distinct groups left as KEEP.
+            units.sort(key=lambda u: -u[2])
+            used = 0.0
+            for members, pcie_ms, _mb in units:
+                if used + pcie_ms <= pcie_budget_ms:
+                    for g in members:
+                        forced_offload.add(g)
+                    used += pcie_ms
+                elif not forced_offload:
+                    # First unit alone exceeds budget — we still must offload
+                    # something or KEEP would OOM.  Take this one and stop.
+                    for g in members:
+                        forced_offload.add(g)
+                    used += pcie_ms
+                else:
+                    for g in members:
+                        forced_keep.add(g)
 
-        # Decide coupled groups
-        coupled_decisions: Dict[str, str] = {}
-        coupled_decisions.update(_decide_coupled_group(_ATTN_COUPLED, group_metrics))
-        coupled_decisions.update(_decide_coupled_group(_MOE_COUPLED, group_metrics))
+        # --- Phase 3: Per-group raw decision ---
+        # When PCIe budget mode is on (or fast-path memory_fits_all):
+        #   forced_offload → OFFLOAD
+        #   forced_keep    → KEEP   (Phase 4 may downgrade if memory budget
+        #                            cannot accommodate)
+        # When PCIe budget mode is OFF (legacy / fallback):
+        #   stall ≤ threshold → OFFLOAD
+        #   stall  > threshold → KEEP (Phase 4 decides budget)
+        raw_decisions: Dict[str, str] = {}
+        if pcie_budget_enabled or memory_fits_all:
+            for g in group_metrics:
+                if g in forced_offload:
+                    raw_decisions[g] = "OFFLOAD"
+                else:
+                    raw_decisions[g] = "KEEP"
+        else:
+            def _decide_coupled_group(coupled_set: Set[str]) -> Dict[str, str]:
+                active = [g for g in coupled_set if g in group_metrics]
+                if not active:
+                    return {}
+                all_low = all(
+                    group_metrics[g]["stall_ms"] <= self._stall_threshold_ms
+                    for g in active
+                )
+                target = "OFFLOAD" if all_low else "KEEP"
+                return {g: target for g in active}
 
-        # --- Phase 3: Decide independent groups (attn_norm, mlp_norm) ---
-        independent_groups = set(group_metrics.keys()) - _ATTN_COUPLED - _MOE_COUPLED
-        for group_name in independent_groups:
-            m = group_metrics[group_name]
-            stall_ms = m["stall_ms"]
+            raw_decisions.update(_decide_coupled_group(_ATTN_COUPLED))
+            raw_decisions.update(_decide_coupled_group(_MOE_COUPLED))
+            independent = (
+                set(group_metrics.keys()) - _ATTN_COUPLED - _MOE_COUPLED
+            )
+            for g in independent:
+                raw_decisions[g] = (
+                    "OFFLOAD"
+                    if group_metrics[g]["stall_ms"] <= self._stall_threshold_ms
+                    else "KEEP"
+                )
 
-            if stall_ms <= self._stall_threshold_ms:
-                coupled_decisions[group_name] = "OFFLOAD"
-            else:
-                # Prefer KEEP; budget enforcement in Phase 4 may downgrade.
-                coupled_decisions[group_name] = "KEEP"
-
-        raw_decisions = coupled_decisions
+        if pcie_budget_enabled:
+            analysis_lines.append(
+                f"  [PCIe budget] backward_total={pcie_budget_ms / pcie_budget_ratio:.2f}ms  "
+                f"budget={pcie_budget_ms:.2f}ms (ratio={pcie_budget_ratio})  "
+                f"forced_offload={sorted(forced_offload)}  "
+                f"forced_keep={sorted(forced_keep)}"
+            )
 
         # --- Phase 4: Memory-budget-aware adjustment ---
         # KEEP decisions that would exceed the memory budget are downgraded
@@ -589,19 +689,30 @@ class OffloadRecomputeOptimizer:
                     # Exceeds budget: downgrade from KEEP.
                     m = group_metrics[g]
                     recompute_net = m["stall_ms"] - m["recompute_ms"]
-                    if recompute_net > 0:
+                    # When the PCIe time budget mode chose this group as
+                    # forced_keep, we MUST NOT downgrade it back to OFFLOAD —
+                    # the PCIe time budget is already saturated by
+                    # forced_offload, adding more H2D would cause stall again.
+                    # In that case fall through to RECOMPUTE* even when
+                    # recompute_net <= 0 (we are forced into recompute).
+                    if recompute_net > 0 or (
+                        pcie_budget_enabled and g in forced_keep
+                    ):
                         raw_decisions[g] = "RECOMPUTE*"
                         analysis_lines.append(
                             f"  [BUDGET] {g}: KEEP→RECOMPUTE* "
-                            f"(total_mem={total_mem_mb:.1f}MB exceeds remaining budget "
-                            f"{remaining_budget_mb:.1f}MB, recompute net_benefit={recompute_net:.2f}ms)"
+                            f"(total_mem={total_mem_mb:.1f}MB exceeds remaining "
+                            f"budget {remaining_budget_mb:.1f}MB, "
+                            f"recompute_net={recompute_net:.2f}ms"
+                            f"{', PCIe-locked' if pcie_budget_enabled and g in forced_keep else ''})"
                         )
                     else:
                         raw_decisions[g] = "OFFLOAD*"
                         analysis_lines.append(
                             f"  [BUDGET] {g}: KEEP→OFFLOAD* "
-                            f"(total_mem={total_mem_mb:.1f}MB exceeds remaining budget "
-                            f"{remaining_budget_mb:.1f}MB, recompute net_benefit={recompute_net:.2f}ms NEGATIVE)"
+                            f"(total_mem={total_mem_mb:.1f}MB exceeds remaining "
+                            f"budget {remaining_budget_mb:.1f}MB, "
+                            f"recompute_net={recompute_net:.2f}ms NEGATIVE)"
                         )
             # For coupled groups, if any member is downgraded, ALL members of
             # the coupled set must be downgraded to the same decision (since
@@ -960,15 +1071,19 @@ class AdaptiveMemoryProfiler:
             self._is_stall_profile_rank = self._is_profile_rank
 
         # Auto-detect memory budget from available GPU memory.
-        # Use a generous fraction (50%) of free memory.  The offload mechanism
-        # already frees activation memory during forward — the budget only
-        # constrains how many activations are KEPT on GPU instead of being
-        # offloaded.  With L20Y 80GB GPUs and typical 20-30 GB base usage,
-        # 50% of free (~25-30 GB) is safe and allows KEEP for large groups
-        # like expert_fc1 (1024 MB × 2 layers = ~2.0 GB) that would otherwise
-        # be unnecessarily recomputed.  The old 10% setting was far too
-        # conservative and wasted 50+ GB of idle GPU memory.
-        _budget_fraction = float(os.environ.get("ADAPTIVE_MEM_BUDGET_FRACTION", "0.50"))
+        #
+        # NOTE on the conservative default (0.20 instead of 0.50):
+        # ``mem_get_info()`` is sampled at the END of the warmup phase, BEFORE
+        # any KEEP decisions take effect.  At that point the activation memory
+        # of *every* offloaded group is already accounted for as "freed" by the
+        # offload mechanism.  Once we KEEP some groups, those activations stay
+        # resident through the *entire* forward of all in-flight microbatches
+        # (1F1B keeps PP-stage-deep activations alive at the same time), so the
+        # peak memory increase is roughly:
+        #     keep_bytes_per_layer × num_layers × num_microbatches_in_flight.
+        # Empirically the previous 0.50 fraction caused OOM on MBS=2.  0.20 is
+        # safer and can be raised back via ADAPTIVE_MEM_BUDGET_FRACTION.
+        _budget_fraction = float(os.environ.get("ADAPTIVE_MEM_BUDGET_FRACTION", "0.20"))
         if self._memory_budget_mb < 0 and torch.cuda.is_available():
             free_mem = torch.cuda.mem_get_info()[0]
             self._memory_budget_mb = (free_mem / (1024**2)) * _budget_fraction

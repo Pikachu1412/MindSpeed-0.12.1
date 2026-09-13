@@ -8,6 +8,26 @@ from typing import Any, Optional
 
 import torch
 
+
+def _get_te_cpu_offload():
+    """Return the transformer_engine cpu_offload module (or None if unavailable).
+
+    Mirrors Megatron-0.12.1's transformer_engine.py shim:
+        try transformer_engine.pytorch.cpu_offload_v1 as cpu_offload
+        else fall back to transformer_engine.pytorch.cpu_offload
+        else None.
+    """
+    try:
+        from transformer_engine.pytorch import cpu_offload_v1 as cpu_offload
+        return cpu_offload
+    except ImportError:
+        try:
+            from transformer_engine.pytorch import cpu_offload
+            return cpu_offload
+        except ImportError:
+            return None
+
+
 # CPU offload implementation for pipeline parallelism
 DEBUG = False
 DEBUG_RANK = 0
@@ -71,6 +91,14 @@ _timing_iter_count = 0
 # applies three-way decisions (OFFLOAD / RECOMPUTE / KEEP) after profiling.
 # When disabled, all groups are offloaded (default behavior, no profiling overhead).
 ADAPTIVE_OFFLOAD_ENABLED = os.environ.get("MEGATRON_ADAPTIVE_OFFLOAD", "0") == "1"
+# ---- Deep prefetch: how many groups to issue in advance ----
+# Default 1 (current behavior).  Increasing it lets H2D queue stay K-deep on
+# h2d_stream so PCIe can be saturated even when single-group H2D > backward
+# compute time.  Trade-off: each in-flight reload occupies GPU memory until
+# its tensor is consumed by backward, so very large K erodes offload's memory
+# benefit.  Set to 0 to fully disable group-level prefetch (only rely on
+# cross-layer / last-layer prefetch).
+PREFETCH_DEPTH = max(0, int(os.environ.get("MEGATRON_PREFETCH_DEPTH", "1")))
 # Only log on rank 0 to avoid duplicate output
 OFFLOAD_SHAPE_LOG_RANK = 0
 
@@ -472,7 +500,7 @@ class PipelineOffloadManager:
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
         debug_rank("----__enter__")
-        from megatron.core.extensions.transformer_engine import cpu_offload
+        cpu_offload = _get_te_cpu_offload()
 
         if cpu_offload is not None:
             cpu_offload.CPUOffloadEnabled = True
@@ -487,7 +515,7 @@ class PipelineOffloadManager:
     def __exit__(self, *args: Any):
         """Exit context manager and restore original tensor saving behavior."""
         debug_rank("----__exit__")
-        from megatron.core.extensions.transformer_engine import cpu_offload
+        cpu_offload = _get_te_cpu_offload()
 
         if cpu_offload is not None:
             cpu_offload.CPUOffloadEnabled = False
@@ -1043,7 +1071,11 @@ class ChunkOffloadHandler:
             name: The group name (e.g., 'core_attn').
             current_gid: The group_id of the current group that just finished.
         """
-        if not H2D_PREFETCH_ENABLED or not CROSS_LAYER_PREFETCH_ENABLED:
+        # Cross-layer prefetch is independent of adjacent-group prefetch:
+        # it just needs CROSS_LAYER_PREFETCH=1.  H2D_PREFETCH controls the
+        # adjacent-group lookahead in commit_backward; the two strategies
+        # can coexist or be enabled separately.
+        if not CROSS_LAYER_PREFETCH_ENABLED:
             return
         if self._num_groups_per_layer is None or self._num_groups_per_layer == 0:
             return
@@ -1288,13 +1320,21 @@ class ChunkOffloadHandler:
         # The list is ordered [L0_g0..L0_g6, L1_g0..L1_g6]; backward
         # consumes from the end (L1 last group first), so the next group
         # to be needed is always at the tail.
-        while len(self._groups_to_reload) > 0:
+        #
+        # PREFETCH_DEPTH controls how many groups we issue in one call.
+        # depth=1 (default) preserves original behavior.  Larger depth keeps
+        # h2d_stream's queue K-deep so PCIe stays saturated when single-group
+        # H2D time exceeds backward compute time.  Each successfully issued
+        # group occupies GPU memory once its H2D completes (until backward
+        # consumes it), trading memory for bandwidth utilization.
+        _issued = 0
+        while len(self._groups_to_reload) > 0 and _issued < PREFETCH_DEPTH:
             if self.bulk_reload_group(self._groups_to_reload[-1]):
                 debug_rank(
                     f"--bulk_reload_next: prefetched {self._groups_to_reload[-1]}"
                 )
                 self._groups_to_reload.pop()
-                break
+                _issued += 1
             else:
                 # Group already consumed by tensor_pop (sync path), skip
                 self._groups_to_reload.pop()

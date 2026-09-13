@@ -32,10 +32,8 @@ def te_grouped_mlp_init_wrapper(original_init):
         # When offloading expert_fc1, set save_original_input so that linear_fc1
         # saves the original input tensor (not split views) via save_for_backward.
         if self.offload_expert_fc1 and not self.config.fp8:
-            from megatron.core.extensions.transformer_engine import (
-                set_save_original_input,
-            )
-            set_save_original_input(self.linear_fc1)
+            if hasattr(self.linear_fc1, 'save_original_input'):
+                self.linear_fc1.save_original_input = True
 
     return wrapper
 

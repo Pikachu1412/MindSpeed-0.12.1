@@ -1,4 +1,3 @@
-import sys
 from argparse import ArgumentParser, Namespace
 
 from mindspeed.features_manager.feature import MindSpeedFeature
@@ -35,22 +34,39 @@ class AdaptiveOffloadFeature(MindSpeedFeature):
         )
 
     def pre_register_patches(self, patch_manager: MindSpeedPatchesManager, args: Namespace):
-        """Inject MindSpeed modules into sys.modules so that Megatron imports resolve."""
+        """Patch TransformerConfig with default attributes so that any
+        `self.config.fine_grained_activation_offloading` access works even
+        before the core_transformer_config_from_args wrapper sets them."""
         if not getattr(args, 'fine_grained_activation_offloading', False):
             return
 
-        from mindspeed.core.pipeline_parallel.adaptive_offload import (
-            fine_grained_activation_offload as _fgao_mod,
-            adaptive_memory_profiler as _amp_mod,
-            offload_profiler as _op_mod,
-        )
-        sys.modules['megatron.core.pipeline_parallel.fine_grained_activation_offload'] = _fgao_mod
-        sys.modules['megatron.core.pipeline_parallel.adaptive_memory_profiler'] = _amp_mod
-        sys.modules['megatron.core.pipeline_parallel.offload_profiler'] = _op_mod
+        from megatron.core.transformer.transformer_config import TransformerConfig
+        if not hasattr(TransformerConfig, 'fine_grained_activation_offloading'):
+            TransformerConfig.fine_grained_activation_offloading = False
+        if not hasattr(TransformerConfig, 'offload_modules'):
+            TransformerConfig.offload_modules = None
+        if not hasattr(TransformerConfig, 'min_offloaded_tensor_size'):
+            TransformerConfig.min_offloaded_tensor_size = 1024 * 1024
 
     def register_patches(self, patch_manager: MindSpeedPatchesManager, args: Namespace):
         if not getattr(args, 'fine_grained_activation_offloading', False):
             return
+
+        # --- Args -> Config bridge: propagate offload fields onto TransformerConfig ---
+        from mindspeed.core.pipeline_parallel.adaptive_offload.gpt_model_wrapper import (
+            core_transformer_config_from_args_wrapper,
+            gpt_model_forward_wrapper,
+        )
+        patch_manager.register_patch(
+            'megatron.training.arguments.core_transformer_config_from_args',
+            core_transformer_config_from_args_wrapper,
+        )
+
+        # --- GPTModel.forward wrapper: init chunk handler before forward ---
+        patch_manager.register_patch(
+            'megatron.core.models.gpt.gpt_model.GPTModel.forward',
+            gpt_model_forward_wrapper,
+        )
 
         # --- Schedules wrappers: inject fine_grained_offloading_reset ---
         from mindspeed.core.pipeline_parallel.adaptive_offload.schedules_wrapper import (
@@ -97,6 +113,22 @@ class AdaptiveOffloadFeature(MindSpeedFeature):
         patch_manager.register_patch(
             'megatron.core.transformer.transformer_layer.TransformerLayer._forward_mlp',
             forward_mlp_wrapper,
+        )
+
+        # --- TransformerBlock / TransformerLayer wrappers: set is_last_layer ---
+        # Required for LAST_LAYER_NO_OFFLOAD to actually take effect.  Without
+        # these, the chunk handler's ``is_last_layer`` flag is never set True.
+        from mindspeed.core.pipeline_parallel.adaptive_offload.transformer_block_wrapper import (
+            transformer_block_init_wrapper,
+            transformer_layer_forward_wrapper,
+        )
+        patch_manager.register_patch(
+            'megatron.core.transformer.transformer_block.TransformerBlock.__init__',
+            transformer_block_init_wrapper,
+        )
+        patch_manager.register_patch(
+            'megatron.core.transformer.transformer_layer.TransformerLayer.forward',
+            transformer_layer_forward_wrapper,
         )
 
         # --- Attention wrappers: inject qkv/core_attn/attn_proj offload groups ---
