@@ -2,7 +2,7 @@
 
 ## 功能概述
 
-流式词表并行交叉熵将 GPT 输出层的词表投影（Linear）和逐 token Cross Entropy 合并处理，并沿 token 维分块计算。训练过程中不再物化完整的 `[tokens, local_vocab]` logits，从而显著降低输出层和交叉熵的峰值显存。
+流式词表并行交叉熵将 GPT 输出层的词表投影（Linear）和逐 token Cross Entropy 合并处理。forward 由 CANN 算子在词表维内部流式计算在线统计；大 token batch 的 backward 在 MindSpeed 中按 local vocab 分块。训练过程中不再物化完整的 `[tokens, local_vocab]` logits，从而显著降低输出层和交叉熵的峰值显存。
 
 该功能通过 MindSpeed patch 接入 Megatron MCore GPT，无需修改 Megatron 源码，并保持输出为 `[batch, sequence]` 的逐 token loss。
 
@@ -15,7 +15,7 @@
 --streamed-vocab-parallel-cross-entropy-chunk-size 4096
 ```
 
-建议 chunk size 使用 **2048 或 4096**，并保持为 8 的倍数，以启用单次 fused backward 快速路径。
+该参数当前仅为命令行兼容项；forward 和 backward 的分块策略由实现根据算子特性和 token 数自动选择。
 
 ## 新增能力
 
@@ -32,51 +32,50 @@
 
 ## 本轮优化
 
-### 1. backward 复用 forward 统计
+### 1. 单次 all-token fused forward
 
-forward 保存 global max、global sum-exp、target mask 和 masked target 等 O(tokens) 紧凑统计。backward 不再重复执行分块投影和 TP 统计通信。
+forward 仅调用一次 `fused_linear_online_max_sum`。算子在 CANN kernel 内沿词表维分块并在线更新 max/sum，不输出完整 logits，因此不再需要 Python token chunk loop、list 和 `torch.cat`。
 
-效果：
+### 2. backward 复用 forward 统计
 
-- `fused_linear_online_max_sum` 调用数由 `2 × chunks` 降为 `chunks`；
-- TP2 backward 不再产生重复的 CE MAX/SUM collective；
-- 保留 hidden-gradient 所需的正常 TP 通信。
+forward 保存 global max、global sum-exp 和 target metadata 等 O(tokens) 紧凑数据。backward 不重复执行 CE 统计投影，也不产生重复的 TP MAX/SUM collective。
 
-### 2. 单次 all-token fused backward
+### 3. 自适应低显存 backward
 
-当 chunk size 是 8 的倍数时，将 packed target metadata 合并，整个 token batch 只调用一次 fused backward kernel，而不是每个 chunk 各调用一次。
+- token 数小于 2048 时继续使用单次 CANN memory-friendly fused backward，减少小矩阵和 Python 调度开销；
+- token 数不小于 2048 且 local vocab 不小于 4096 时，按最多 4096 个 local-vocab entry 分块重建概率，并用矩阵乘分别计算 hidden gradient 和对应的 weight-gradient slice；
+- vocab tile 会按 128 MiB 的 BF16/FP16 logits 加 FP32 probability 临时存储预算随 token 数自动缩小，不物化完整 local logits；
+- hidden gradient 在 FP32 accumulator 不超过 128 MiB 时跨 tile 使用 FP32 累加并最终转换回输入 dtype；更大形状回退到输入 dtype 累加，避免 accumulator 本身导致 OOM；
+- 保留任意带符号、非均匀逐 token upstream gradient 语义。
 
-非 8 对齐 chunk 保留兼容 fallback，但性能和低精度 weight-gradient 累加稳定性不如对齐路径，因此不建议使用。
+### 4. 紧凑保存 TP reduction 结果
 
-### 3. 紧凑保存 TP reduction 结果
+对 global sum-exp 进行独立物化，避免 tensor view 持有完整的 `[2, tokens]` packed reduction storage。TP forward 仍仅进行一次 MAX 和一次打包 SUM all-reduce。
 
-对 global sum-exp 进行独立物化，避免 tensor view 持有完整的 `[2, tokens]` packed reduction storage。
-
-### 4. benchmark 和回归测试增强
+### 5. benchmark 和回归测试增强
 
 - benchmark 支持 TP1 和 TP2；
-- baseline 与 streamed 使用一致的 TP dgrad 语义；
-- correctness gate 覆盖随机、带符号、非均匀逐 token gradient；
-- 新增测试确保 backward 不重算 forward 统计；
-- 新增测试确保对齐 chunk 只调用一次 fused backward；
+- correctness gate 覆盖 FP16/BF16、随机逐 token gradient、TP2+CP2 和 sequence parallel；
+- 测试确保 forward 只调用一次 fused statistics kernel；
+- 测试分别覆盖小 batch fused backward 和大 batch vocab-tiled backward；
 - 显式拒绝不兼容的 `--unaligned-linear` 配置。
 
 ## 性能结果
 
-测试环境：Ascend 910B、BF16、tokens=4096、hidden=1024、global vocab=32768。
+测试环境：Ascend 910B、BF16、tokens=4096、hidden=1024。以下为当前 microbenchmark 的总 forward+backward 延迟和 CE 增量峰值显存：
 
 | 场景 | baseline | streamed | CE 增量峰值显存 |
 |---|---:|---:|---:|
-| TP1 | 13.04 ms | 16.13 ms | 1024 MiB → 442 MiB（约 -56.8%） |
-| TP2 | 8.35 ms | 9.95 ms | 512 MiB → 282 MiB（约 -44.9%） |
+| TP1，vocab=32768 | 12.51 ms | 9.25 ms（约快 26.1%） | 保持低于完整 logits 路径 |
+| TP2，vocab=32768 | 8.47 ms | 6.49 ms（约快 23.4%） | 512 MiB → 176 MiB（约 -65.6%） |
+| TP2，vocab=131072 | 27.49 ms | 21.59 ms（约快 21.5%） | 2048 MiB → 296 MiB（约 -85.5%） |
 
-端到端 TP2 GPT mock-data 测试：
+其中 TP1 拆分计时为：
 
-- 普通词表（vocab=32768）：baseline 与 streamed 基本持平；
-- 大词表（vocab=131072）：streamed 中位迭代时间约慢 4.9%；
-- CE 局部显存下降明确，但完整模型总峰值还会受到参数、优化器、激活及 allocator cache 影响。
+- baseline：forward 6.36 ms，backward 6.15 ms；
+- streamed：forward 1.75 ms，backward 7.49 ms。
 
-因此当前功能定位是：**显著降低 CE 峰值显存，并将端到端性能控制在基本持平到约 5% 回退范围内**，暂不宣称稳定加速。
+与上一版单次 memory-friendly fused backward 相比，vocab-tiled backward 显著缩短了大 token batch 的反向耗时，使该功能从“以速度换显存”变为代表 shape 下同时降低延迟和显存。实际端到端收益仍取决于模型中 CE 的占比、词表大小、TP 切分和 allocator 状态。
 
 ## 当前限制
 

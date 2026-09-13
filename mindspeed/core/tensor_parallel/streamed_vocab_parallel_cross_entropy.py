@@ -32,6 +32,11 @@ class _StreamedLossSentinel:
 
 
 _STREAMED_LOSS_CONTEXT = ContextVar("streamed_vocab_parallel_loss", default=None)
+_TILED_BACKWARD_MIN_TOKENS = 2048
+_TILED_BACKWARD_MIN_LOCAL_VOCAB = 4096
+_TILED_BACKWARD_VOCAB_CHUNK_SIZE = 4096
+_TILED_BACKWARD_LOGITS_BUDGET = 128 * 1024 * 1024
+_TILED_BACKWARD_GRAD_INPUT_FP32_BUDGET = 128 * 1024 * 1024
 _REQUIRED_NPU_OPERATORS = {
     "fused_linear_online_max_sum": (
         "Tensor input", "Tensor weight", "Tensor target",
@@ -76,38 +81,26 @@ def _all_reduce(tensor, op):
         )
 
 
-def _batched_statistics(input_, weight, target, chunk_size, vocab_start_index, vocab_end_index):
-    """Project chunks locally, then batch collectives over their small statistics."""
-    local_max_chunks = []
-    local_sum_chunks = []
-    predicted_chunks = []
-    target_mask_chunks = []
-    masked_target_chunks = []
-    for start in range(0, target.numel(), chunk_size):
-        end = min(start + chunk_size, target.numel())
-        statistics = torch_npu.fused_linear_online_max_sum(
-            input_[start:end], weight, target[start:end],
-            vocab_start_index, vocab_end_index, False
-        )
-        local_max_chunks.append(statistics[0])
-        local_sum_chunks.append(statistics[1])
-        predicted_chunks.append(statistics[2])
-        target_mask_chunks.append(statistics[3])
-        masked_target_chunks.append(statistics[4])
-
-    local_logits_max = torch.cat(local_max_chunks)
+def _batched_statistics(input_, weight, target, chunk_size,
+                        vocab_start_index, vocab_end_index):
+    """Project all tokens while the fused kernel streams over vocabulary tiles."""
+    del chunk_size
+    statistics = torch_npu.fused_linear_online_max_sum(
+        input_, weight, target, vocab_start_index, vocab_end_index, False
+    )
+    local_logits_max = statistics[0]
     global_logits_max = local_logits_max.clone()
     _all_reduce(global_logits_max, torch.distributed.ReduceOp.MAX)
 
     # The operator returns statistics relative to each rank's local maximum.
     # Rebase both quantities to the global maximum before reducing. The sum and
     # target-logit reductions are packed together to avoid one collective.
-    sum_exp_logits = torch.cat(local_sum_chunks) * torch.exp(
+    sum_exp_logits = statistics[1] * torch.exp(
         local_logits_max - global_logits_max
     )
     target_in_partition = (target >= vocab_start_index) & (target < vocab_end_index)
     predicted_logits = (
-        (torch.cat(predicted_chunks) + local_logits_max - global_logits_max)
+        (statistics[2] + local_logits_max - global_logits_max)
         * target_in_partition
     )
     reduced = torch.stack((sum_exp_logits, predicted_logits))
@@ -116,9 +109,52 @@ def _batched_statistics(input_, weight, target, chunk_size, vocab_start_index, v
         global_logits_max,
         reduced[0].clone(),
         reduced[1],
-        target_mask_chunks,
-        masked_target_chunks,
+        statistics[3],
+        statistics[4],
     )
+
+
+def _tiled_backward(grad_output, input_, weight, target, logits_max,
+                    sum_exp_logits, vocab_start_index):
+    """Compute projection gradients without materializing the full local logits."""
+    use_fp32_grad_input = (
+        input_.numel() * torch.tensor([], dtype=torch.float32).element_size()
+        <= _TILED_BACKWARD_GRAD_INPUT_FP32_BUDGET
+    )
+    grad_input = torch.zeros_like(
+        input_, dtype=torch.float32 if use_fp32_grad_input else input_.dtype
+    )
+    grad_weight = torch.empty_like(weight)
+    token_indices = torch.arange(target.numel(), device=target.device)
+    vocab_chunk_size = min(
+        _TILED_BACKWARD_VOCAB_CHUNK_SIZE,
+        max(128, _TILED_BACKWARD_LOGITS_BUDGET // (target.numel() * 6) // 128 * 128),
+    )
+    for start in range(0, weight.size(0), vocab_chunk_size):
+        end = min(start + vocab_chunk_size, weight.size(0))
+        chunk_weight = weight[start:end]
+        grad_logits = torch.matmul(input_, chunk_weight.t()).float()
+        grad_logits.sub_(logits_max.unsqueeze(1)).exp_()
+        grad_logits.div_(sum_exp_logits.unsqueeze(1))
+
+        chunk_vocab_start = vocab_start_index + start
+        target_in_chunk = (
+            (target >= chunk_vocab_start)
+            & (target < vocab_start_index + end)
+        )
+        chunk_target = (target - chunk_vocab_start).clamp(0, end - start - 1)
+        grad_logits[token_indices, chunk_target] -= target_in_chunk
+        grad_logits.mul_(grad_output.unsqueeze(1))
+        grad_logits = grad_logits.to(weight.dtype)
+
+        chunk_grad_input = torch.matmul(grad_logits, chunk_weight)
+        grad_input.add_(
+            chunk_grad_input.float() if use_fp32_grad_input else chunk_grad_input
+        )
+        grad_weight[start:end].copy_(torch.matmul(grad_logits.t(), input_))
+    if use_fp32_grad_input:
+        grad_input = grad_input.to(input_.dtype)
+    return grad_input, grad_weight
 
 
 class _StreamedVocabParallelCrossEntropy(torch.autograd.Function):
@@ -147,51 +183,45 @@ class _StreamedVocabParallelCrossEntropy(torch.autograd.Function):
             statistics[0], statistics[1], statistics[2]
         )
 
-        ctx.chunk_size = chunk_size
-        ctx.all_token_backward = chunk_size % 8 == 0
-        if ctx.all_token_backward:
+        ctx.use_tiled_backward = (
+            flat_hidden.size(0) >= _TILED_BACKWARD_MIN_TOKENS
+            and weight.size(0) >= _TILED_BACKWARD_MIN_LOCAL_VOCAB
+        )
+        ctx.vocab_start_index = vocab_start_index
+        if ctx.use_tiled_backward:
             ctx.save_for_backward(
-                hidden_states, weight, statistics[0], statistics[1],
-                torch.cat(statistics[3]), torch.cat(statistics[4])
+                hidden_states, weight, flat_target, statistics[0], statistics[1]
             )
         else:
             ctx.save_for_backward(
                 hidden_states, weight, statistics[0], statistics[1],
-                *statistics[3], *statistics[4]
+                statistics[3], statistics[4]
             )
-            ctx.num_chunks = len(statistics[3])
         return losses.view_as(target)
 
     @staticmethod
     def backward(ctx, grad_output):
-        hidden_states, weight, logits_max, sum_exp_logits, *chunk_metadata = ctx.saved_tensors
-        flat_hidden = hidden_states.reshape(-1, hidden_states.size(-1))
         flat_grad_output = grad_output.reshape(-1).float()
-
-        if ctx.all_token_backward:
+        if ctx.use_tiled_backward:
+            hidden_states, weight, target, logits_max, sum_exp_logits = ctx.saved_tensors
+            flat_hidden = hidden_states.reshape(-1, hidden_states.size(-1))
+            grad_input, grad_weight = _tiled_backward(
+                flat_grad_output, flat_hidden, weight, target,
+                logits_max, sum_exp_logits, ctx.vocab_start_index,
+            )
+        else:
+            (
+                hidden_states, weight, logits_max, sum_exp_logits,
+                target_mask, masked_target,
+            ) = ctx.saved_tensors
+            flat_hidden = hidden_states.reshape(-1, hidden_states.size(-1))
             grad_input, grad_weight = (
                 torch_npu.fused_linear_cross_entropy_loss_with_max_sum_grad(
                     flat_grad_output, flat_hidden, weight,
-                    chunk_metadata[0], chunk_metadata[1], 0.0,
+                    target_mask, masked_target, 0.0,
                     logits_max, sum_exp_logits, None
                 )
             )
-        else:
-            target_masks = chunk_metadata[:ctx.num_chunks]
-            masked_targets = chunk_metadata[ctx.num_chunks:]
-            grad_input = torch.empty_like(flat_hidden)
-            grad_weight = torch.zeros_like(weight)
-            for index, start in enumerate(range(0, flat_grad_output.numel(), ctx.chunk_size)):
-                end = min(start + ctx.chunk_size, flat_grad_output.numel())
-                chunk_grad_input, chunk_grad_weight = (
-                    torch_npu.fused_linear_cross_entropy_loss_with_max_sum_grad(
-                        flat_grad_output[start:end], flat_hidden[start:end], weight,
-                        target_masks[index], masked_targets[index], 0.0,
-                        logits_max[start:end], sum_exp_logits[start:end], None
-                    )
-                )
-                grad_input[start:end].copy_(chunk_grad_input)
-                grad_weight.add_(chunk_grad_weight)
 
         return (
             grad_input.view_as(hidden_states),

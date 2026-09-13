@@ -18,7 +18,7 @@ class StreamedVocabParallelCrossEntropyFeature(MindSpeedFeature):
         )
         group.add_argument(
             "--streamed-vocab-parallel-cross-entropy-chunk-size", type=int, default=4096,
-            help="Maximum number of tokens projected at once by streamed cross entropy."
+            help="Deprecated compatibility option; the fused operator streams internally."
         )
 
     def validate_args(self, args):

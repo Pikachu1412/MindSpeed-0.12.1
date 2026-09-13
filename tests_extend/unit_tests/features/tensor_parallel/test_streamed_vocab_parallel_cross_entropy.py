@@ -83,6 +83,53 @@ class TestStreamedVocabParallelCrossEntropy(DistributedTest):
         )
         parallel_state.destroy_model_parallel()
 
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_tiled_backward_matches_reference(self, dtype):
+        initialize_model_parallel(2, 1)
+        torch.manual_seed(2031)
+        sequence_length, batch_size, hidden_size = 9, 3, 32
+        vocab_size = 16384
+        labels = torch.randint(0, vocab_size, (batch_size, sequence_length), device="npu")
+        hidden = 0.1 * torch.randn(
+            sequence_length, batch_size, hidden_size, device="npu", dtype=dtype
+        )
+        weight = 0.1 * torch.randn(
+            vocab_size // 2, hidden_size, device="npu", dtype=dtype
+        )
+        grad_output = torch.randn(batch_size, sequence_length, device="npu")
+
+        original_threshold = streamed_ce._TILED_BACKWARD_MIN_TOKENS
+        streamed_ce._TILED_BACKWARD_MIN_TOKENS = 1
+        try:
+            streamed_hidden = hidden.detach().clone().requires_grad_()
+            streamed_weight = weight.detach().clone().requires_grad_()
+            streamed_loss = streamed_vocab_parallel_cross_entropy(
+                streamed_hidden, streamed_weight, labels, 7
+            )
+            (streamed_loss * grad_output).sum().backward()
+        finally:
+            streamed_ce._TILED_BACKWARD_MIN_TOKENS = original_threshold
+
+        reference_hidden = hidden.detach().clone().requires_grad_()
+        reference_weight = weight.detach().clone().requires_grad_()
+        logits = F.linear(
+            copy_to_tensor_model_parallel_region(reference_hidden), reference_weight
+        )
+        reference_loss = vocab_parallel_cross_entropy(
+            logits, labels.transpose(0, 1).contiguous()
+        ).transpose(0, 1).contiguous()
+        (reference_loss * grad_output).sum().backward()
+
+        tolerance = 2e-3 if dtype == torch.float16 else 2e-2
+        assert torch.allclose(streamed_loss, reference_loss, atol=2e-5, rtol=2e-5)
+        assert torch.allclose(
+            streamed_hidden.grad, reference_hidden.grad, atol=tolerance, rtol=tolerance
+        )
+        assert torch.allclose(
+            streamed_weight.grad, reference_weight.grad, atol=tolerance, rtol=tolerance
+        )
+        parallel_state.destroy_model_parallel()
+
     def test_backward_reuses_forward_statistics(self):
         initialize_model_parallel(2, 1)
         torch.manual_seed(2027)
@@ -117,7 +164,38 @@ class TestStreamedVocabParallelCrossEntropy(DistributedTest):
             streamed_ce._batched_statistics = original_batched_statistics
             parallel_state.destroy_model_parallel()
 
-    def test_aligned_chunks_use_one_backward_kernel(self):
+    def test_aligned_chunks_use_one_forward_kernel(self):
+        initialize_model_parallel(2, 1)
+        torch.manual_seed(2029)
+        sequence_length, batch_size, hidden_size = 9, 3, 32
+        vocab_size = 256
+        labels = torch.randint(0, vocab_size, (batch_size, sequence_length), device="npu")
+        hidden = 0.1 * torch.randn(
+            sequence_length, batch_size, hidden_size,
+            device="npu", dtype=torch.bfloat16, requires_grad=True
+        )
+        weight = 0.1 * torch.randn(
+            vocab_size // 2, hidden_size,
+            device="npu", dtype=torch.bfloat16, requires_grad=True
+        )
+
+        original_forward = streamed_ce.torch_npu.fused_linear_online_max_sum
+        call_count = 0
+
+        def counted_forward(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return original_forward(*args, **kwargs)
+
+        streamed_ce.torch_npu.fused_linear_online_max_sum = counted_forward
+        try:
+            streamed_vocab_parallel_cross_entropy(hidden, weight, labels, 8)
+            assert call_count == 1
+        finally:
+            streamed_ce.torch_npu.fused_linear_online_max_sum = original_forward
+            parallel_state.destroy_model_parallel()
+
+    def test_small_batches_use_one_fused_backward_kernel(self):
         initialize_model_parallel(2, 1)
         torch.manual_seed(2028)
         sequence_length, batch_size, hidden_size = 9, 3, 32
@@ -148,6 +226,41 @@ class TestStreamedVocabParallelCrossEntropy(DistributedTest):
             assert call_count == 1
         finally:
             streamed_ce.torch_npu.fused_linear_cross_entropy_loss_with_max_sum_grad = original_backward
+            parallel_state.destroy_model_parallel()
+
+    def test_large_batches_use_tiled_backward(self):
+        initialize_model_parallel(2, 1)
+        torch.manual_seed(2030)
+        token_count, hidden_size = streamed_ce._TILED_BACKWARD_MIN_TOKENS, 32
+        vocab_size = 256
+        labels = torch.randint(0, vocab_size, (1, token_count), device="npu")
+        hidden = 0.1 * torch.randn(
+            token_count, 1, hidden_size,
+            device="npu", dtype=torch.bfloat16, requires_grad=True
+        )
+        weight = 0.1 * torch.randn(
+            vocab_size // 2, hidden_size,
+            device="npu", dtype=torch.bfloat16, requires_grad=True
+        )
+
+        original_backward = streamed_ce.torch_npu.fused_linear_cross_entropy_loss_with_max_sum_grad
+        original_min_vocab = streamed_ce._TILED_BACKWARD_MIN_LOCAL_VOCAB
+        streamed_ce._TILED_BACKWARD_MIN_LOCAL_VOCAB = 1
+        call_count = 0
+
+        def counted_backward(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return original_backward(*args, **kwargs)
+
+        streamed_ce.torch_npu.fused_linear_cross_entropy_loss_with_max_sum_grad = counted_backward
+        try:
+            loss = streamed_vocab_parallel_cross_entropy(hidden, weight, labels, 8)
+            loss.sum().backward()
+            assert call_count == 0
+        finally:
+            streamed_ce.torch_npu.fused_linear_cross_entropy_loss_with_max_sum_grad = original_backward
+            streamed_ce._TILED_BACKWARD_MIN_LOCAL_VOCAB = original_min_vocab
             parallel_state.destroy_model_parallel()
 
     def test_sequence_parallel_matches_reference(self):
