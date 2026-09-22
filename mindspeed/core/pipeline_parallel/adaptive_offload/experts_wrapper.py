@@ -71,7 +71,10 @@ def te_grouped_mlp_forward_wrapper(original_forward):
         )
         _MOE_SUBGROUPS = {"moe_act", "expert_fc1"}
         _recompute_mlp = bool(_MOE_SUBGROUPS & _dyn_recompute_groups)
-        _keep_mlp = bool(_MOE_SUBGROUPS & _dyn_skip_groups)
+        _keep_mlp = all(
+            not getattr(self, flag, False) or group in _dyn_skip_groups
+            for group, flag in (("expert_fc1", "offload_expert_fc1"), ("moe_act", "offload_moe_act"))
+        )
         _skip_offload = _recompute_mlp or _keep_mlp
 
         if _skip_offload:
@@ -79,8 +82,8 @@ def te_grouped_mlp_forward_wrapper(original_forward):
                 self, permuted_local_hidden_states, tokens_per_expert, permuted_probs
             )
 
-        _do_offload_expert_fc1 = getattr(self, 'offload_expert_fc1', False)
-        _do_offload_moe_act = getattr(self, 'offload_moe_act', False)
+        _do_offload_expert_fc1 = getattr(self, 'offload_expert_fc1', False) and "expert_fc1" not in _dyn_skip_groups
+        _do_offload_moe_act = getattr(self, 'offload_moe_act', False) and "moe_act" not in _dyn_skip_groups
 
         # --- Replicate the forward logic with offload calls injected ---
         # Mirrors Megatron experts.py:848-993
@@ -194,7 +197,8 @@ def te_grouped_mlp_forward_wrapper(original_forward):
 
         if _do_offload_moe_act:
             (output,) = fine_grained_offloading_group_commit(
-                output, name="moe_act", forced_released_tensors=[fc1_output]
+                output, name="moe_act",
+                forced_released_tensors=[] if "expert_fc1" in _dyn_skip_groups else [fc1_output]
             )
 
         # FP8 unpadding

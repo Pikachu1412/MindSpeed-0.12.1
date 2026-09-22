@@ -8,6 +8,9 @@ from typing import Any, Optional
 
 import torch
 
+from .offload_transport_audit import OffloadTransportAudit
+from .saved_activation_identity import SavedActivationIdentity
+
 
 def _get_te_cpu_offload():
     """Return the transformer_engine cpu_offload module (or None if unavailable).
@@ -99,6 +102,9 @@ ADAPTIVE_OFFLOAD_ENABLED = os.environ.get("MEGATRON_ADAPTIVE_OFFLOAD", "0") == "
 # benefit.  Set to 0 to fully disable group-level prefetch (only rely on
 # cross-layer / last-layer prefetch).
 PREFETCH_DEPTH = max(0, int(os.environ.get("MEGATRON_PREFETCH_DEPTH", "1")))
+LAYER_PREFETCH_DEPTH = max(0, int(os.environ.get("MEGATRON_LAYER_PREFETCH_DEPTH", "1")))
+LAYER_PREFETCH_DELAY_GROUPS = max(0, int(os.environ.get("MEGATRON_LAYER_PREFETCH_DELAY_GROUPS", "0")))
+RELOAD_EVENT_SYNC_ENABLED = os.environ.get("MEGATRON_OFFLOAD_EVENT_SYNC", "0") == "1"
 # Only log on rank 0 to avoid duplicate output
 OFFLOAD_SHAPE_LOG_RANK = 0
 
@@ -135,9 +141,39 @@ def get_profiler():
     return _profiler
 
 
+_applied_cpu_affinity = None
+
+
+def _parse_cpu_affinity(value):
+    cpus = set()
+    for token in value.split(","):
+        lower, separator, upper = token.strip().partition("-")
+        first = int(lower)
+        last = int(upper) if separator else first
+        if first < 0 or last < first:
+            raise ValueError(f"Invalid CPU affinity range: {token}")
+        cpus.update(range(first, last + 1))
+    return cpus
+
+
 def set_ideal_affinity_for_current_gpu():
-    """Set CPU affinity for the current GPU to optimize host-device transfers."""
-    return
+    """Apply an explicitly configured rank-local CPU mask before offload allocation."""
+    global _applied_cpu_affinity
+    specification = os.environ.get("MEGATRON_OFFLOAD_CPU_AFFINITY", "")
+    if not specification:
+        return
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    masks = specification.split(";")
+    if local_rank < 0 or local_rank >= len(masks):
+        raise ValueError("CPU affinity requires one mask per local rank")
+    requested = _parse_cpu_affinity(masks[local_rank])
+    identity = (local_rank, tuple(sorted(requested)))
+    if _applied_cpu_affinity == identity:
+        return
+    if not requested or not requested.issubset(os.sched_getaffinity(0)):
+        raise ValueError("Requested offload CPU affinity is outside the allowed CPU mask")
+    os.sched_setaffinity(0, requested)
+    _applied_cpu_affinity = identity
 
 
 def debug_rank(message):
@@ -247,6 +283,8 @@ class PinnedMemoryPool:
             "free_buffers": total_free,
             "pending_buffers": total_pending,
             "unique_shapes": len(self._free),
+            "retained_bytes": sum(buffer.numel() * buffer.element_size() for buffer in self._pending)
+            + sum(buffer.numel() * buffer.element_size() for buffers in self._free.values() for buffer in buffers),
         }
 
 
@@ -268,6 +306,10 @@ class PipelineOffloadManager:
 
     def __init__(self):
         """Initialize the manager with queues and dedicated CUDA streams."""
+        if ADAPTIVE_OFFLOAD_ENABLED and (
+            RELOAD_EVENT_SYNC_ENABLED or LAYER_PREFETCH_DEPTH != 1 or LAYER_PREFETCH_DELAY_GROUPS != 0
+        ):
+            raise RuntimeError("Experimental reload scheduling requires MEGATRON_ADAPTIVE_OFFLOAD=0")
         # Queue to store chunk handlers for backward pass
         self._queue = deque()
         # Cache chunk handlers for each virtual pipeline stage
@@ -277,6 +319,8 @@ class PipelineOffloadManager:
         self._h2d_stream = torch.cuda.Stream()
         # Pinned memory pool for reusing CPU buffers across iterations
         self._pinned_memory_pool = PinnedMemoryPool()
+        self.transport_audit = OffloadTransportAudit()
+        self.transport_audit.pinned_memory_pool = self._pinned_memory_pool
         # --- Adaptive offload decision state ---
         # Groups to keep on GPU (KEEP decision from V3 optimizer)
         self._skip_offload_groups: set = set()
@@ -366,6 +410,7 @@ class PipelineOffloadManager:
 
     def reset(self):
         """Reset manager state for a new training iteration."""
+        self.transport_audit.start()
         # ---- Flush last-layer timing data before resetting state ----
         # Guard with hasattr because reset() is called from __init__ before
         # _cur_backward_chunk / _queue are assigned.
@@ -488,6 +533,7 @@ class PipelineOffloadManager:
     def set_last_layer(self, is_last_layer):
         """Mark whether the current forward chunk is processing the last layer."""
         self._cur_forward_chunk.is_last_layer = is_last_layer
+        self._cur_forward_chunk.layer_index += 1
 
     def cur_forward_chunk(self):
         """Get the current forward pass chunk handler."""
@@ -588,6 +634,9 @@ class ChunkOffloadHandler:
     def __init__(self, is_first_last_vpp_chunk, min_offloaded_tensor_size):
         # Data Structure to maintain reference to activation tensors
         self._tensor_tag_to_state = {}
+        self._saved_activation_groups = {}
+        self._tensor_aliases = {}
+        self._tensor_consumers = {}
         # Mark the first microbatch of the last virtual pipeline stage
         self._is_first_last_vpp_chunk = is_first_last_vpp_chunk
 
@@ -598,9 +647,12 @@ class ChunkOffloadHandler:
         # Set of gids whose H2D reload has already been issued on h2d_stream.
         # Used by commit_backward to avoid issuing duplicate reloads.
         self._reload_issued = set()
+        self._reloaded_tensor_tags = set()
         self._tensor_count_current_group = 0
         # Mapping from group_id to group name for logging
         self._group_id_to_name = {}
+        self._fwd_profile_events = {}
+        self._bwd_profile_events = {}
 
         # ---- Cross-layer prefetch state ----
         # Number of offload groups per transformer layer (auto-detected after
@@ -617,6 +669,8 @@ class ChunkOffloadHandler:
         # duplicate work when multiple groups within the same layer call
         # prefetch_previous_layer.
         self._last_prefetched_layer = None
+        self._prefetched_layers = set()
+        self._layer_backward_groups = {}
 
         # ---- Last-layer-no-offload timing instrumentation ----
         # Accumulated CUDA event pairs for deferred timing measurement.
@@ -641,6 +695,8 @@ class ChunkOffloadHandler:
         self._reload_events_by_id = {}
         self.min_offloaded_tensor_size = min_offloaded_tensor_size
         self.is_last_layer = False
+        self.layer_index = -1
+        self._group_layer_metadata = {}
 
     def flush_timing_events(self):
         """Synchronize and print all accumulated CUDA event timings.
@@ -709,6 +765,17 @@ class ChunkOffloadHandler:
             self._tensor_count_current_group += 1
             assert tensor_tag not in self._tensor_tag_to_state, "Duplicate tensor tag"
             self._tensor_tag_to_state[tensor_tag] = tensor
+            if self.tensor_need_offloading_checker(tensor):
+                identities = self._saved_activation_groups.get(tensor_tag[0])
+                if identities is None:
+                    identities = SavedActivationIdentity()
+                    self._saved_activation_groups[tensor_tag[0]] = identities
+                identities.record(tensor_tag, tensor)
+                group_name = self._group_id_to_name.get(tensor_tag[0], "unassigned")
+                PipelineOffloadManager.get_instance().transport_audit.record(
+                    "candidate", group_name, self.layer_index, self.is_last_layer,
+                    tensor.numel() * tensor.element_size(),
+                )
         else:
             # Use negative group ID for special tensor types
             tensor_tag = (-1, self.torch_tensor_count)
@@ -727,8 +794,13 @@ class ChunkOffloadHandler:
         and we raise an error.
         """
         debug_rank(f"--------tensor_pop {tensor_tag}")
-        assert tensor_tag in self._tensor_tag_to_state, f"Tag {tensor_tag} not found"
-        tensor = self._tensor_tag_to_state.pop(tensor_tag)
+        aliases = getattr(self, '_tensor_aliases', {})
+        consumers = getattr(self, '_tensor_consumers', {})
+        canonical_tag = aliases.get(tensor_tag, tensor_tag)
+        shared = canonical_tag in consumers
+        assert canonical_tag in self._tensor_tag_to_state, f"Tag {tensor_tag} not found"
+        assert not shared or tensor_tag in aliases, f"Tag {tensor_tag} already consumed"
+        tensor = self._tensor_tag_to_state[canonical_tag]
 
         if isinstance(tensor, tuple):
             # This should not happen — bulk_reload_group should have already
@@ -745,8 +817,42 @@ class ChunkOffloadHandler:
                 f"offloaded (tuple). bulk_reload_group should have reloaded it "
                 f"before backward compute. _reload_issued={self._reload_issued}"
             )
+        if shared:
+            del aliases[tensor_tag]
+            consumers[canonical_tag] -= 1
+            if consumers[canonical_tag] == 0:
+                del consumers[canonical_tag]
+                del self._tensor_tag_to_state[canonical_tag]
+        else:
+            del self._tensor_tag_to_state[canonical_tag]
         debug_rank(f"--------tensor_pop {tensor.shape}")
+        if shared or (RELOAD_EVENT_SYNC_ENABLED and canonical_tag in self._reloaded_tensor_tags):
+            tensor.record_stream(torch.cuda.current_stream())
+            if canonical_tag not in self._tensor_tag_to_state:
+                self._reloaded_tensor_tags.discard(canonical_tag)
         return tensor
+
+    def _group_offload_aliases(self, group_id):
+        identities = getattr(self, '_saved_activation_groups', {}).get(group_id)
+        if identities is None:
+            return {}
+        return {alias: canonical for alias, canonical in identities.aliases().items()
+                if alias in self._tensor_tag_to_state and canonical in self._tensor_tag_to_state
+                and self.tensor_need_offloading_checker(self._tensor_tag_to_state[alias])
+                and self.tensor_need_offloading_checker(self._tensor_tag_to_state[canonical])}
+
+    def _coalesce_offload_group(self, group_id, name):
+        aliases = self._group_offload_aliases(group_id)
+        for alias, canonical in aliases.items():
+            tensor = self._tensor_tag_to_state.pop(alias)
+            self._tensor_aliases[canonical] = canonical
+            self._tensor_aliases[alias] = canonical
+            self._tensor_consumers[canonical] = self._tensor_consumers.get(canonical, 1) + 1
+            layer, last_layer = self._group_layer_metadata[group_id]
+            PipelineOffloadManager.get_instance().transport_audit.record(
+                "deduplicated", name, layer, last_layer, tensor.numel() * tensor.element_size(),
+            )
+        getattr(self, '_saved_activation_groups', {}).pop(group_id, None)
 
     def tensor_need_offloading_checker(self, tensor):
         """Check if the tensor needs to be offloaded."""
@@ -779,6 +885,7 @@ class ChunkOffloadHandler:
         debug_rank("------bulk_offload_group")
         assert not self.is_first_last_layer(), "Should not offload first-last layer"
         group_id_to_offload, name = group_to_offload
+        self._coalesce_offload_group(group_id_to_offload, name)
         # torch.cuda.nvtx.range_push("activation offloading " + name)
 
         # Record timing for profiling
@@ -786,7 +893,12 @@ class ChunkOffloadHandler:
             start_time = time.time()
 
         offloaded_tensor = None  # Track for profiling
+        adaptive_profiler = get_adaptive_profiler()
+        profile_transfer = adaptive_profiler is not None and adaptive_profiler.is_stall_profiling_active()
         with torch.cuda.stream(self.d2h_stream):
+            if profile_transfer:
+                transfer_start = torch.cuda.Event(enable_timing=True)
+                transfer_start.record()
             for tensor_tag, state in self._tensor_tag_to_state.items():
                 group_id, _ = tensor_tag
                 if group_id == group_id_to_offload:
@@ -805,12 +917,21 @@ class ChunkOffloadHandler:
                             f"nbytes={tensor_bytes / 1024 / 1024:.3f}MB"
                         )
                         state = self.offload(tensor_on_device)
-                        event = torch.cuda.Event()
-                        event.record(self.d2h_stream)
-                        self._offload_events[name] = event
-                        self._offload_events_by_id[group_id_to_offload] = event
+                        layer, last_layer = self._group_layer_metadata[group_id_to_offload]
+                        PipelineOffloadManager.get_instance().transport_audit.record(
+                            "d2h", name, layer, last_layer, tensor_bytes,
+                        )
                         tensor_on_device.record_stream(self.d2h_stream)
                         self._tensor_tag_to_state[tensor_tag] = state
+            if offloaded_tensor is not None:
+                event = torch.cuda.Event()
+                event.record(self.d2h_stream)
+                self._offload_events[name] = event
+                self._offload_events_by_id[group_id_to_offload] = event
+            if profile_transfer and offloaded_tensor is not None:
+                transfer_end = torch.cuda.Event(enable_timing=True)
+                transfer_end.record()
+                adaptive_profiler.enqueue_transfer_events(name, "d2h", transfer_start, transfer_end)
 
         # Record to profiler
         if OFFLOAD_PROFILING:
@@ -850,37 +971,57 @@ class ChunkOffloadHandler:
             start_time = time.time()
             wait_time = 0.0
 
+        adaptive_profiler = get_adaptive_profiler()
+        profile_transfer = adaptive_profiler is not None and adaptive_profiler.is_stall_profiling_active()
+        transfer_start = None
+        offload_waited = False
         with torch.cuda.stream(self.h2d_stream):
             for tensor_label, state in self._tensor_tag_to_state.items():
                 group_id, _ = tensor_label
                 if group_id == group_id_to_reload:
                     debug_rank(f"----tensor_label {tensor_label}")
                     found_reload_group = True
-                    # Use group_id-indexed event for cross-layer safety;
-                    # fall back to name-indexed for backward compat.
-                    event = self._offload_events_by_id.get(
-                        group_id_to_reload, self.get_offload_event(name)
-                    )
                     # Only reload if tensor was offloaded (stored as tuple)
                     if isinstance(state, tuple):
                         # Wait for offload to complete before reloading
-                        if OFFLOAD_PROFILING:
-                            wait_start_time = time.time()
-                        torch.cuda.current_stream().wait_event(event)
-                        if OFFLOAD_PROFILING:
-                            wait_time = (time.time() - wait_start_time) * 1000
+                        if not offload_waited:
+                            event = self._offload_events_by_id.get(group_id_to_reload)
+                            if event is None:
+                                event = self.get_offload_event(name)
+                            if OFFLOAD_PROFILING:
+                                wait_start_time = time.time()
+                            torch.cuda.current_stream().wait_event(event)
+                            if OFFLOAD_PROFILING:
+                                wait_time = (time.time() - wait_start_time) * 1000
+                            offload_waited = True
 
+                        if profile_transfer and transfer_start is None:
+                            transfer_start = torch.cuda.Event(enable_timing=True)
+                            transfer_start.record()
                         recovered_tensor = self.reload(state)
+                        layer, last_layer = self._group_layer_metadata[group_id_to_reload]
+                        PipelineOffloadManager.get_instance().transport_audit.record(
+                            "h2d", name, layer, last_layer,
+                            recovered_tensor.numel() * recovered_tensor.element_size(),
+                        )
                         shape_log_rank(
                             f"[OFFLOAD_SHAPE][H2D  ] group={name!r} tag={tensor_label} "
                             f"shape={list(recovered_tensor.shape)} dtype={recovered_tensor.dtype} "
                             f"nbytes={recovered_tensor.numel() * recovered_tensor.element_size() / 1024 / 1024:.3f}MB"
                         )
-                        event.record(self.h2d_stream)
-                        self._reload_events[name] = event
-                        self._reload_events_by_id[group_id_to_reload] = event
                         debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
                         self._tensor_tag_to_state[tensor_label] = recovered_tensor
+                        if RELOAD_EVENT_SYNC_ENABLED:
+                            self._reloaded_tensor_tags.add(tensor_label)
+            if offload_waited:
+                event = torch.cuda.Event()
+                event.record(self.h2d_stream)
+                self._reload_events[name] = event
+                self._reload_events_by_id[group_id_to_reload] = event
+            if transfer_start is not None:
+                transfer_end = torch.cuda.Event(enable_timing=True)
+                transfer_end.record()
+                adaptive_profiler.enqueue_transfer_events(name, "h2d", transfer_start, transfer_end)
 
         if found_reload_group:
             self._reload_issued.add(group_id_to_reload)
@@ -934,8 +1075,8 @@ class ChunkOffloadHandler:
     def bulk_offload(self, forced_released_tensors):
         """Offload a group of tensors and optionally release their GPU memory."""
         debug_rank("----bulk_offload")
+        group_to_offload = self._groups_to_offload.pop()
         if self.should_bulk_offload():
-            group_to_offload = self._groups_to_offload.pop()
             self._groups_to_reload.append(group_to_offload)
             self.bulk_offload_group(group_to_offload)
             # Manually release tensors not auto-freed by torch GC.
@@ -946,6 +1087,16 @@ class ChunkOffloadHandler:
                         # Ensure tensor is not in use before freeing
                         release_tensor.record_stream(cur_stream)
                         release_tensor.untyped_storage().resize_(0)
+        else:
+            group_id, group_name = group_to_offload
+            self._saved_activation_groups.pop(group_id, None)
+            layer, last_layer = self._group_layer_metadata[group_id]
+            for tensor_tag, tensor in self._tensor_tag_to_state.items():
+                if tensor_tag[0] == group_id and not isinstance(tensor, tuple) and self.tensor_need_offloading_checker(tensor):
+                    PipelineOffloadManager.get_instance().transport_audit.record(
+                        "kept", group_name, layer, last_layer,
+                        tensor.numel() * tensor.element_size(),
+                    )
 
     def on_group_commit_forward(self, forced_released_tensors):
         """Called at the end of a layer group's forward pass to trigger offloading.
@@ -958,22 +1109,13 @@ class ChunkOffloadHandler:
         """
         debug_rank("--on_group_commit_forward")
 
-        # Record forward compute end event for adaptive profiler
         _ap = get_adaptive_profiler()
-        if (
-            _ap is not None
-            and _ap.is_stall_profiling_active()
-            and hasattr(self, "_fwd_compute_start_event")
-            and self._fwd_compute_start_event is not None
-        ):
+        committed_gid, committed_name = self._groups_to_offload[-1]
+        start_event = self._fwd_profile_events.pop(committed_gid, None)
+        if _ap is not None and _ap.is_stall_profiling_active() and start_event is not None:
             _fwd_end = torch.cuda.Event(enable_timing=True)
             _fwd_end.record()
-            _ap.enqueue_forward_compute_events(
-                self._fwd_compute_group_name,
-                self._fwd_compute_start_event,
-                _fwd_end,
-            )
-            self._fwd_compute_start_event = None
+            _ap.enqueue_forward_compute_events(committed_name, start_event, _fwd_end)
 
         # Wait for compute to finish before starting offload (sync rule #1)
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
@@ -992,14 +1134,23 @@ class ChunkOffloadHandler:
             )
             if group_name is not None:
                 total_bytes = 0
+                logical_bytes = 0
                 target_gid = self._groups_to_offload[-1][0]
+                aliases = self._group_offload_aliases(target_gid)
                 for tensor_tag, state in self._tensor_tag_to_state.items():
                     gid, _ = tensor_tag
                     if gid == target_gid and not isinstance(state, tuple):
                         if self.tensor_need_offloading_checker(state):
-                            total_bytes += state.numel() * state.element_size()
+                            tensor_bytes = state.numel() * state.element_size()
+                            logical_bytes += tensor_bytes
+                            if tensor_tag not in aliases:
+                                total_bytes += tensor_bytes
                 if total_bytes > 0:
-                    _ap.record_group_offload_bytes(group_name, total_bytes)
+                    _ap.record_group_offload_bytes(
+                        group_name, total_bytes,
+                        sum(tensor.numel() * tensor.element_size() for tensor in forced_released_tensors),
+                        logical_bytes=logical_bytes,
+                    )
 
         self.bulk_offload(forced_released_tensors)
         return committed_gid
@@ -1132,7 +1283,28 @@ class ChunkOffloadHandler:
                 f"gid={target_gid}"
             )
 
+    def _prepare_reload_stream(self):
+        if not RELOAD_EVENT_SYNC_ENABLED:
+            self.h2d_stream.wait_stream(torch.cuda.current_stream())
+
     def prefetch_previous_layer(self, current_gid):
+        if not LAST_LAYER_NO_OFFLOAD_ENABLED or LAYER_PREFETCH_DEPTH == 0:
+            return
+        self._build_cross_layer_index()
+        if not self._total_groups_per_layer:
+            return
+        current_layer = (current_gid - 1) // self._total_groups_per_layer
+        seen_groups = self._layer_backward_groups.setdefault(current_layer, set())
+        seen_groups.add(current_gid)
+        if len(seen_groups) <= LAYER_PREFETCH_DELAY_GROUPS:
+            return
+        for offset in range(LAYER_PREFETCH_DEPTH):
+            source_gid = current_gid - offset * self._total_groups_per_layer
+            if source_gid <= 0:
+                break
+            self._prefetch_previous_layer_batch(source_gid)
+
+    def _prefetch_previous_layer_batch(self, current_gid):
         """Prefetch ALL groups of the previous layer (last-layer-no-offload strategy).
 
         Called from ``on_group_commit_backward`` when LAST_LAYER_NO_OFFLOAD is
@@ -1195,9 +1367,10 @@ class ChunkOffloadHandler:
         # in range [0, total_layers - 2], which are all offloaded layers.
 
         # Check if we already prefetched this layer (avoid duplicate work).
-        if self._last_prefetched_layer == prev_layer:
+        if prev_layer in self._prefetched_layers:
             return  # Already prefetched
         self._last_prefetched_layer = prev_layer
+        self._prefetched_layers.add(prev_layer)
 
         debug_rank(
             f"--prefetch_previous_layer: starting L{current_layer}->L{prev_layer}"
@@ -1209,7 +1382,7 @@ class ChunkOffloadHandler:
         # on_group_commit_backward, so that subsequent commit_backward calls
         # within the same layer do NOT insert redundant sync points on
         # h2d_stream that would stall in-flight H2D transfers.
-        self.h2d_stream.wait_stream(torch.cuda.current_stream())
+        self._prepare_reload_stream()
 
         # Collect all groups belonging to prev_layer from _name_layer_to_gid.
         # prev_layer is within [0, _num_layers - 1], so it's in the index.
@@ -1406,7 +1579,7 @@ class ChunkOffloadHandler:
                 )
                 if _has_offloaded_tensor:
                     # Offloaded group not yet prefetched — issue sync H2D.
-                    self.h2d_stream.wait_stream(torch.cuda.current_stream())
+                    self._prepare_reload_stream()
                     group_info = self._group_id_to_name.get(cur_group_id)
                     if group_info is not None:
                         self.bulk_reload_group((cur_group_id, group_info))
@@ -1416,7 +1589,7 @@ class ChunkOffloadHandler:
         else:
             # Default path: sync rule #2 — h2d_stream must wait for previous
             # backward to finish before we can issue H2D.
-            self.h2d_stream.wait_stream(torch.cuda.current_stream())
+            self._prepare_reload_stream()
             # Issue H2D for current group if not already done (e.g. by
             # pre_reload_last_layer or a previous prefetch).
             group_info = self._group_id_to_name.get(cur_group_id)
@@ -1426,7 +1599,7 @@ class ChunkOffloadHandler:
         # ---- Step 2: Wait for current group's H2D to complete (sync rule #4) ----
         # Record CUDA events around the wait_event to measure stall time
         # for the adaptive profiler (deferred measurement — no synchronize here).
-        if LAST_LAYER_NO_OFFLOAD_ENABLED:
+        if LAST_LAYER_NO_OFFLOAD_ENABLED or RELOAD_EVENT_SYNC_ENABLED:
             # In LAST_LAYER_NO_OFFLOAD mode, only look up by gid (no name fallback).
             # The name-indexed _reload_events can contain stale events from a
             # *different* layer's same-named group (e.g., Layer 0's core_attn event
@@ -1470,6 +1643,8 @@ class ChunkOffloadHandler:
                 _stall_end = torch.cuda.Event(enable_timing=True)
                 _stall_end.record()
                 _ap.enqueue_stall_events(name, _stall_start, _stall_end)
+                for _, _, excluded in self._bwd_profile_events.values():
+                    excluded.append((_stall_start, _stall_end))
 
             # ---- Last-layer timing: capture stall end ----
             if _do_ll_timing:
@@ -1498,9 +1673,9 @@ class ChunkOffloadHandler:
 
         # Record backward compute start event (after stall, before backward compute)
         if _stall_profiling:
-            self._bwd_compute_start_event = torch.cuda.Event(enable_timing=True)
-            self._bwd_compute_start_event.record()
-            self._bwd_compute_group_name = name
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            self._bwd_profile_events[cur_group_id] = (name, start_event, [])
 
         # ---- Last-layer timing: record backward compute start ----
         if _do_ll_timing:
@@ -1514,15 +1689,7 @@ class ChunkOffloadHandler:
         self._last_bwd_group_gid = cur_group_id
 
         # ---- Step 3: Prefetch ----
-        # Profiling guard: during stall profiling, disable prefetch so that
-        # the profiler measures TRUE stall times (without overlap).  If
-        # prefetch runs during profiling, measured stall drops to ~0 and
-        # the optimizer would incorrectly conclude OFFLOAD is free, keeping
-        # everything offloaded instead of switching strategies.
-        if _ap is not None and not _ap.is_profiling_done():
-            # Profiling in progress — skip prefetch to preserve accurate stall data
-            pass
-        elif LAST_LAYER_NO_OFFLOAD_ENABLED:
+        if LAST_LAYER_NO_OFFLOAD_ENABLED:
             # ---- Last-layer-no-offload: layer-granularity prefetch ----
             # Prefetch ALL groups of the previous layer at once.  The first
             # commit_backward of each layer triggers the prefetch; subsequent
@@ -1555,18 +1722,17 @@ class ChunkOffloadHandler:
         self._tensor_count_current_group = 0
         self._groups_to_offload.append((self._offloaded_group_index, name))
         self._group_id_to_name[self._offloaded_group_index] = name
+        self._group_layer_metadata[self._offloaded_group_index] = (self.layer_index, self.is_last_layer)
 
         # Record forward compute start event for adaptive profiler
         _ap = get_adaptive_profiler()
         if _ap is not None and _ap.is_stall_profiling_active():
-            self._fwd_compute_start_event = torch.cuda.Event(enable_timing=True)
-            self._fwd_compute_start_event.record()
-            self._fwd_compute_group_name = name
-        else:
-            self._fwd_compute_start_event = None
-            self._fwd_compute_group_name = None
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            self._fwd_profile_events[self._offloaded_group_index] = start_event
+        return self._offloaded_group_index
 
-    def on_group_start_backward(self):
+    def on_group_start_backward(self, name, group_id):
         """
         Called AFTER a layer group's backward compute completes (autograd reversal).
 
@@ -1580,21 +1746,13 @@ class ChunkOffloadHandler:
         debug_rank("--on_group_start_backward")
         # Record backward compute end event for adaptive profiler
         _ap = get_adaptive_profiler()
-        if (
-            _ap is not None
-            and _ap.is_stall_profiling_active()
-            and hasattr(self, "_bwd_compute_start_event")
-            and self._bwd_compute_start_event is not None
-        ):
+        profile_events = self._bwd_profile_events.pop(group_id, None)
+        if _ap is not None and _ap.is_stall_profiling_active() and profile_events is not None:
             _bwd_end = torch.cuda.Event(enable_timing=True)
             _bwd_end.record()
             _ap.enqueue_backward_compute_events(
-                self._bwd_compute_group_name,
-                self._bwd_compute_start_event,
-                _bwd_end,
+                profile_events[0], profile_events[1], _bwd_end, profile_events[2]
             )
-            self._bwd_compute_start_event = None
-            self._bwd_compute_group_name = None
 
         # ---- Last-layer timing: record backward compute duration ----
         if (
@@ -1618,14 +1776,8 @@ class ChunkOffloadHandler:
         # After the current group's backward compute finishes, prefetch the
         # same-named module from the previous layer.  The H2D transfer on
         # h2d_stream will overlap with the next group's backward compute.
-        if (
-            CROSS_LAYER_PREFETCH_ENABLED
-            and hasattr(self, "_last_bwd_group_name")
-            and self._last_bwd_group_name is not None
-        ):
-            self.prefetch_cross_layer(
-                self._last_bwd_group_name, self._last_bwd_group_gid
-            )
+        if CROSS_LAYER_PREFETCH_ENABLED:
+            self.prefetch_cross_layer(name, group_id)
 
 
 class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
@@ -1691,7 +1843,8 @@ class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
         ctx.cpu_offload_handler = cpu_offload_handler
         debug_rank("FineGrainedOffloadingGroupStartFunction forward")
 
-        cpu_offload_handler.on_group_start_forward(name)
+        ctx.group_id = cpu_offload_handler.on_group_start_forward(name)
+        ctx.name = name
         # return the identical tensor
         return tensor
 
@@ -1700,7 +1853,7 @@ class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
         # pylint: disable=missing-function-docstring
         debug_rank("FineGrainedOffloadingGroupStartFunction backward")
         cpu_offload_handler = ctx.cpu_offload_handler
-        cpu_offload_handler.on_group_start_backward()
+        cpu_offload_handler.on_group_start_backward(ctx.name, ctx.group_id)
         return grad_output, None, None
 
 

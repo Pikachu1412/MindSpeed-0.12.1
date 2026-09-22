@@ -10,6 +10,48 @@ from functools import wraps
 from megatron.core import tensor_parallel
 
 
+def _fgao_layer_needs_wrapper(self, profiler, offload_mgr):
+    """Return True if the fine-grained offload wrapper must run for this layer.
+
+    The wrapper reimplements _forward_attention/_forward_mlp in Python to inject
+    offload group_start/commit, profiling contexts, and DYNAMIC recompute/keep
+    overrides.  When none of those apply, the native forward is byte-for-byte
+    equivalent AND faster (avoids ~5% fixed overhead + extra activation memory).
+
+    IMPORTANT: the ``mlp_norm`` offload group spans BOTH methods (group_start in
+    _forward_attention, group_commit in _forward_mlp), so a single shared
+    predicate must gate BOTH wrappers identically — otherwise start/commit
+    desync and the offload group stack corrupts.  We therefore consider every
+    group touched by either method here.
+    """
+    if profiler is not None and profiler.is_profiling_active():
+        return True
+
+    dyn_recompute = offload_mgr.recompute_groups if offload_mgr is not None else set()
+    dyn_skip = offload_mgr.skip_offload_groups if offload_mgr is not None else set()
+
+    # Static per-layer offload flags (set in __init__ / experts init).
+    if (getattr(self, "offload_attn_norm", False) and "attn_norm" not in dyn_skip) or (
+        getattr(self, "offload_mlp_norm", False) and "mlp_norm" not in dyn_skip
+    ):
+        return True
+
+    # Any dynamic override on any group handled by these two methods.
+    _ALL_GROUPS = {
+        "attn_norm",
+        "qkv_linear",
+        "core_attn",
+        "attn_proj",
+        "mlp_norm",
+        "expert_fc1",
+        "moe_act",
+    }
+    if _ALL_GROUPS & dyn_recompute:
+        return True
+
+    return False
+
+
 def transformer_layer_init_wrapper(original_init):
     """Wrap TransformerLayer.__init__ to set offload flags for attn_norm / mlp_norm."""
 
@@ -19,6 +61,15 @@ def transformer_layer_init_wrapper(original_init):
 
         # Set offload flags based on config — mirrors Megatron transformer_layer.py:383-392
         from megatron.core.transformer.identity_op import IdentityOp
+        from megatron.core.transformer.moe.moe_layer import BaseMoELayer
+
+        self._is_moe_layer = isinstance(self.mlp, BaseMoELayer)
+
+        self.mlp._offload_dense_mlp = (
+            not self._is_moe_layer
+            and self.config.fine_grained_activation_offloading
+            and 'dense_mlp' in (self.config.offload_modules or [])
+        )
 
         self.offload_attn_norm = (
             self.config.fine_grained_activation_offloading
@@ -76,6 +127,27 @@ def forward_attention_wrapper(original_forward_attention):
 
         # Determine dynamic recompute/KEEP groups from the optimizer.
         _offload_mgr = PipelineOffloadManager.get_instance()
+
+        # Fast path: when this layer injects nothing (no offload, no profiling,
+        # no dynamic override), fall through to the native _forward_attention.
+        # Must use the SAME predicate as _forward_mlp so the mlp_norm group
+        # (start here, commit there) stays paired.
+        if not _fgao_layer_needs_wrapper(self, _profiler, _offload_mgr):
+            return original_forward_attention(
+                self,
+                hidden_states,
+                attention_mask=attention_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
+
         _dyn_recompute_groups = (
             _offload_mgr.recompute_groups if _offload_mgr is not None else set()
         )
@@ -110,7 +182,7 @@ def forward_attention_wrapper(original_forward_attention):
 
         # Optional Input Layer norm with profiling context
         with (
-            _profiler.profile_module(self.layer_number, "attn_norm", _is_moe)
+            _profiler.profile_module(self.layer_number, "attn_norm", _is_moe, hidden_states)
             if _profiler.is_profiling_active()
             else contextlib.nullcontext()
         ):
@@ -120,7 +192,9 @@ def forward_attention_wrapper(original_forward_attention):
                 )
                 with get_fine_grained_offloading_context(_do_offload_attn_norm):
                     input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                        self.input_layernorm, hidden_states
+                        _profiler.profile_checkpoint_callable(
+                            self.input_layernorm, self.layer_number, "attn_norm", _is_moe
+                        ), hidden_states
                     )
             else:
                 with get_fine_grained_offloading_context(_do_offload_attn_norm):
@@ -128,7 +202,7 @@ def forward_attention_wrapper(original_forward_attention):
 
         # Self attention with profiling context
         with (
-            _profiler.profile_module(self.layer_number, "attention", _is_moe)
+            _profiler.profile_module(self.layer_number, "attention", _is_moe, input_layernorm_output)
             if _profiler.is_profiling_active()
             else contextlib.nullcontext()
         ):
@@ -148,7 +222,9 @@ def forward_attention_wrapper(original_forward_attention):
                     return self.self_attention(hidden, **_attn_kwargs)
 
                 attention_output_with_bias = tensor_parallel.checkpoint(
-                    _run_self_attention,
+                    _profiler.profile_checkpoint_callable(
+                        _run_self_attention, self.layer_number, "attention", _is_moe
+                    ),
                     False,
                     input_layernorm_output,
                 )
@@ -224,7 +300,7 @@ def forward_attention_wrapper(original_forward_attention):
             )
 
         with (
-            _profiler.profile_module(self.layer_number, "mlp_norm", _is_moe)
+            _profiler.profile_module(self.layer_number, "mlp_norm", _is_moe, hidden_states)
             if _profiler.is_profiling_active()
             else contextlib.nullcontext()
         ):
@@ -232,7 +308,9 @@ def forward_attention_wrapper(original_forward_attention):
                 self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
                 with get_fine_grained_offloading_context(_do_offload_mlp_norm):
                     pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                        self.pre_mlp_layernorm, hidden_states
+                        _profiler.profile_checkpoint_callable(
+                            self.pre_mlp_layernorm, self.layer_number, "mlp_norm", _is_moe
+                        ), hidden_states
                     )
             else:
                 with get_fine_grained_offloading_context(_do_offload_mlp_norm):
@@ -262,14 +340,19 @@ def forward_mlp_wrapper(original_forward_mlp):
         _is_moe = getattr(self, "_is_moe_layer", False)
 
         _offload_mgr = PipelineOffloadManager.get_instance()
+
+        # Fast path: identical predicate to forward_attention_wrapper so the
+        # mlp_norm group (started in _forward_attention) is only committed here
+        # when the wrapper also ran there.
+        if not _fgao_layer_needs_wrapper(self, _profiler, _offload_mgr):
+            return original_forward_mlp(self, pre_mlp_layernorm_output, residual)
+
         _dyn_recompute_groups = (
             _offload_mgr.recompute_groups if _offload_mgr is not None else set()
         )
         _dyn_skip_groups = (
             _offload_mgr.skip_offload_groups if _offload_mgr is not None else set()
         )
-
-        # mlp_norm discard logic
         _recompute_mlp_norm = self.recompute_pre_mlp_layernorm or (
             "mlp_norm" in _dyn_recompute_groups
         )
@@ -285,13 +368,15 @@ def forward_mlp_wrapper(original_forward_mlp):
 
         # MLP with profiling context
         with (
-            _profiler.profile_module(self.layer_number, "mlp", _is_moe)
+            _profiler.profile_module(self.layer_number, "mlp", _is_moe, pre_mlp_layernorm_output)
             if _profiler.is_profiling_active()
             else contextlib.nullcontext()
         ):
             if self.recompute_mlp or _dyn_recompute_mlp:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    self.mlp, False, pre_mlp_layernorm_output
+                    _profiler.profile_checkpoint_callable(
+                        self.mlp, self.layer_number, "mlp", _is_moe
+                    ), False, pre_mlp_layernorm_output
                 )
             else:
                 mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)

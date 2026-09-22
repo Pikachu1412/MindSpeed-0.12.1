@@ -65,7 +65,12 @@ def attention_forward_wrapper(original_forward):
         )
         _ATTN_SUBGROUPS = {"qkv_linear", "core_attn", "attn_proj"}
         _recompute_attention = bool(_ATTN_SUBGROUPS & _dyn_recompute_groups)
-        _keep_attention = bool(_ATTN_SUBGROUPS & _dyn_skip_groups)
+        _keep_attention = all(
+            not getattr(self, flag, False) or group in _dyn_skip_groups
+            for group, flag in (("qkv_linear", "offload_qkv_linear"),
+                                ("core_attn", "offload_core_attention"),
+                                ("attn_proj", "offload_attn_proj"))
+        )
         _skip_offload = _recompute_attention or _keep_attention
 
         if _skip_offload:
@@ -73,9 +78,9 @@ def attention_forward_wrapper(original_forward):
             return original_forward(self, *args, **kwargs)
 
         # Determine per-group offload decisions.
-        _do_offload_qkv_linear = getattr(self, 'offload_qkv_linear', False)
-        _do_offload_core_attn = getattr(self, 'offload_core_attention', False)
-        _do_offload_attn_proj = getattr(self, 'offload_attn_proj', False)
+        _do_offload_qkv_linear = getattr(self, 'offload_qkv_linear', False) and "qkv_linear" not in _dyn_skip_groups
+        _do_offload_core_attn = getattr(self, 'offload_core_attention', False) and "core_attn" not in _dyn_skip_groups
+        _do_offload_attn_proj = getattr(self, 'offload_attn_proj', False) and "attn_proj" not in _dyn_skip_groups
 
         # We need to intercept the forward to insert group_start/commit around
         # the three computation phases. Since the original forward has complex
@@ -247,7 +252,7 @@ def attention_forward_wrapper(original_forward):
             if _do_offload_core_attn and self.training:
                 (core_attn_out,) = fine_grained_offloading_group_commit(
                     core_attn_out, name="core_attn",
-                    forced_released_tensors=[query, key, value],
+                    forced_released_tensors=[] if "qkv_linear" in _dyn_skip_groups else [query, key, value],
                 )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
@@ -266,12 +271,12 @@ def attention_forward_wrapper(original_forward):
             if bias is not None:
                 output, bias = fine_grained_offloading_group_commit(
                     output, bias, name="attn_proj",
-                    forced_released_tensors=[core_attn_out],
+                    forced_released_tensors=[] if "core_attn" in _dyn_skip_groups else [core_attn_out],
                 )
             else:
                 (output,) = fine_grained_offloading_group_commit(
                     output, name="attn_proj",
-                    forced_released_tensors=[core_attn_out],
+                    forced_released_tensors=[] if "core_attn" in _dyn_skip_groups else [core_attn_out],
                 )
 
         return output, bias

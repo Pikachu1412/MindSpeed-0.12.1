@@ -69,30 +69,29 @@ def train_wrapper(original_train):
                         _model_cfg = _m.config
                         break
                 if _model_cfg is not None:
-                    _num_layers = get_num_layers_to_build(_model_cfg)
+                    _num_layers = sum(
+                        len(_model.decoder.layers) if hasattr(_model, "decoder")
+                        else get_num_layers_to_build(_model.config)
+                        for _model in _unwrapped
+                    )
                     _adaptive_profiler.set_num_layers_on_this_rank(_num_layers)
             except Exception:
                 pass
             _adaptive_profiler._layers_count_set = True
+
+        from mindspeed.core.pipeline_parallel.adaptive_offload.auto_activation_memory import initialize_profile_cache
+        from megatron.training import get_args
+        initialize_profile_cache(_adaptive_profiler, model, get_args())
 
         # --- Monkey-patch train_step to inject pre/post hooks ---
         import megatron.training.training as _training_module
 
         _original_train_step = _training_module.train_step
 
-        def _patched_train_step(*args, **kwargs):
-            # on_iteration_start is called BEFORE train_step.
-            # We get the current iteration from megatron args.
-            from megatron.training import get_args
-            _args = get_args()
-            _iteration = getattr(_args, 'curr_iteration', 0)
-
-            _adaptive_profiler.on_iteration_start(_iteration)
-
-            result = _original_train_step(*args, **kwargs)
-
-            _adaptive_profiler.on_iteration_end(_iteration)
-
+        def _apply_ready_policy():
+            from mindspeed.core.pipeline_parallel.adaptive_offload.auto_activation_memory import enabled
+            if enabled() and not getattr(_adaptive_profiler, '_auto_baseline_validated', False):
+                return
             # Apply optimization results after profiling completes.
             if (
                 _adaptive_profiler.is_profiling_done()
@@ -102,14 +101,13 @@ def train_wrapper(original_train):
                     _adaptive_profiler.apply_optimization_results()
                 )
                 mgr = PipelineOffloadManager.get_instance()
-                if skip_groups:
-                    mgr.skip_offload_groups = skip_groups
-                else:
-                    mgr.skip_offload_groups = set()
-                if recompute_groups:
-                    mgr.recompute_groups = recompute_groups
-                else:
-                    mgr.recompute_groups = set()
+                mgr.skip_offload_groups = skip_groups
+                mgr.recompute_groups = recompute_groups
+                if _adaptive_profiler._plan.execution:
+                    from mindspeed.core.pipeline_parallel.adaptive_offload import fine_grained_activation_offload as runtime
+                    depth = _adaptive_profiler._plan.execution['adjacent_prefetch']
+                    runtime.H2D_PREFETCH_ENABLED = depth > 0 and _adaptive_profiler._plan.execution.get('transport_version') != 1
+                    runtime.PREFETCH_DEPTH = max(depth, 1)
 
                 # Print results on relevant ranks.
                 _should_print = getattr(
@@ -144,18 +142,36 @@ def train_wrapper(original_train):
                         )
                     else:
                         print(
-                            f"[AdaptiveOffload] All groups have sufficient overlap{_label} "
+                            f"[AdaptiveOffload] Joint plan selects OFFLOAD for all active groups{_label} "
                             f"(global_rank={_global_rank}, pp_rank={_pp_rank}), "
-                            "no groups skipped or recomputed.",
+                            "see JOINT-PLAN for predicted cost and memory.",
                             flush=True,
                         )
 
+        def _patched_train_step(*args, **kwargs):
+            from megatron.training import get_args
+
+            _iteration = getattr(get_args(), "curr_iteration", 0)
+            try:
+                _adaptive_profiler.on_iteration_start(_iteration)
+                _adaptive_profiler.synchronize_memory_guard(_iteration)
+                _apply_ready_policy()
+                result = _original_train_step(*args, **kwargs)
+                _adaptive_profiler.on_iteration_end(_iteration)
+                from mindspeed.core.pipeline_parallel.adaptive_offload.auto_activation_memory import advance_reference_validation
+                advance_reference_validation(_adaptive_profiler)
+                _apply_ready_policy()
+            except Exception as exception:
+                from mindspeed.core.pipeline_parallel.adaptive_offload.auto_activation_memory import enabled, report_failure
+                if enabled():
+                    report_failure(_adaptive_profiler, exception)
+                raise
             return result
 
         # Install the patched train_step for the duration of train().
         _training_module.train_step = _patched_train_step
         try:
-            return original_train(
+            result = original_train(
                 forward_step_func,
                 model,
                 optimizer,
@@ -167,6 +183,9 @@ def train_wrapper(original_train):
                 checkpointing_context,
                 non_loss_data_func,
             )
+            from .activation_transfer_scheduler import get_scheduler
+            get_scheduler().flush(wait=True)
+            return result
         finally:
             # Restore original train_step to avoid leaking the patch.
             _training_module.train_step = _original_train_step

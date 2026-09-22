@@ -1,3 +1,4 @@
+import os
 from argparse import ArgumentParser, Namespace
 
 from mindspeed.features_manager.feature import MindSpeedFeature
@@ -11,6 +12,9 @@ class AdaptiveOffloadFeature(MindSpeedFeature):
 
     def register_args(self, parser: ArgumentParser):
         group = parser.add_argument_group(title='Fine-grained activation offloading')
+        group.add_argument('--auto-activation-memory', action='store_true',
+                           default=os.environ.get('AUTO_ACTIVATION_MEMORY') == '1',
+                           help='Automatically profile and choose per-module KEEP/OFFLOAD/RECOMPUTE under a device-memory limit.')
         group.add_argument(
             '--fine-grained-activation-offloading',
             action='store_true',
@@ -24,7 +28,7 @@ class AdaptiveOffloadFeature(MindSpeedFeature):
             default=[],
             help='The submodules to offload. '
                  'Choices: "attn_norm", "qkv_linear", "core_attn", '
-                 '"attn_proj", "mlp_norm", "expert_fc1", "moe_act".',
+                 '"attn_proj", "mlp_norm", "expert_fc1", "moe_act", "dense_mlp".',
         )
         group.add_argument(
             '--min-offloaded-tensor-size',
@@ -32,6 +36,15 @@ class AdaptiveOffloadFeature(MindSpeedFeature):
             default=1024 * 1024,
             help='Minimum tensor size (in elements) to offload.',
         )
+
+    def is_need_apply(self, args):
+        from mindspeed.core.pipeline_parallel.adaptive_offload.auto_activation_memory import configure
+        configure(args)
+        return super().is_need_apply(args)
+
+    def pre_validate_args(self, args):
+        from mindspeed.core.pipeline_parallel.adaptive_offload.auto_activation_memory import configure
+        configure(args)
 
     def pre_register_patches(self, patch_manager: MindSpeedPatchesManager, args: Namespace):
         """Patch TransformerConfig with default attributes so that any
@@ -96,6 +109,27 @@ class AdaptiveOffloadFeature(MindSpeedFeature):
             train_wrapper,
         )
 
+        if getattr(args, 'auto_activation_memory', False):
+            from mindspeed.core.pipeline_parallel.adaptive_offload.auto_activation_memory import (
+                transformer_layer_init_wrapper as auto_layer_init, optimizer_capacity_preflight_wrapper,
+            )
+            from mindspeed.core.pipeline_parallel.adaptive_offload.transformer_block_wrapper import (
+                transformer_block_init_wrapper, transformer_layer_forward_wrapper,
+            )
+            patch_manager.register_patch('megatron.core.transformer.transformer_layer.TransformerLayer.__init__', auto_layer_init)
+            patch_manager.register_patch('megatron.core.transformer.transformer_block.TransformerBlock.__init__', transformer_block_init_wrapper)
+            patch_manager.register_patch('megatron.core.transformer.transformer_layer.TransformerLayer.forward', transformer_layer_forward_wrapper)
+            patch_manager.register_patch('megatron.training.training.get_megatron_optimizer', optimizer_capacity_preflight_wrapper)
+            from mindspeed.core.pipeline_parallel.adaptive_offload.activation_transfer_scheduler import (
+                group_backward_begin_wrapper, group_backward_complete_wrapper, legacy_prefetch_wrapper,
+            )
+            handler = 'mindspeed.core.pipeline_parallel.adaptive_offload.fine_grained_activation_offload.ChunkOffloadHandler'
+            patch_manager.register_patch(handler + '.on_group_commit_backward', group_backward_begin_wrapper)
+            patch_manager.register_patch(handler + '.on_group_start_backward', group_backward_complete_wrapper)
+            patch_manager.register_patch(handler + '.bulk_reload_next', legacy_prefetch_wrapper)
+            patch_manager.register_patch(handler + '.pre_reload_last_layer', legacy_prefetch_wrapper)
+            return
+
         # --- TransformerLayer wrappers: inject offload group logic ---
         from mindspeed.core.pipeline_parallel.adaptive_offload.transformer_layer_wrapper import (
             transformer_layer_init_wrapper,
@@ -145,6 +179,14 @@ class AdaptiveOffloadFeature(MindSpeedFeature):
             attention_forward_wrapper,
         )
 
+        from mindspeed.core.pipeline_parallel.adaptive_offload.dense_mlp_wrapper import (
+            dense_mlp_forward_wrapper,
+        )
+        patch_manager.register_patch(
+            'megatron.core.transformer.mlp.MLP.forward',
+            dense_mlp_forward_wrapper,
+        )
+
         # --- Experts wrappers: inject expert_fc1/moe_act offload groups ---
         from mindspeed.core.pipeline_parallel.adaptive_offload.experts_wrapper import (
             te_grouped_mlp_init_wrapper,
@@ -165,3 +207,8 @@ class AdaptiveOffloadFeature(MindSpeedFeature):
                 raise AssertionError(
                     'Fine-grained activation offloading requires --transformer-impl transformer_engine'
                 )
+            if 'dense_mlp' in (getattr(args, 'offload_modules', None) or []):
+                if os.environ.get('MEGATRON_ADAPTIVE_OFFLOAD', '0') == '1':
+                    raise ValueError('dense_mlp offload currently requires MEGATRON_ADAPTIVE_OFFLOAD=0')
+                if getattr(args, 'recompute_granularity', None) is not None or getattr(args, 'recompute_activation_function', False):
+                    raise ValueError('dense_mlp offload does not yet support activation checkpointing')

@@ -146,6 +146,27 @@ def linear_with_grad_accum_forward_wrapper(fn):
     return wrapper
 
 
+class _LinearGradAccumulationContext:
+    __slots__ = ('_real', '_combined')
+
+    def __init__(self, real_ctx, saved_tensors):
+        object.__setattr__(self, '_real', real_ctx)
+        object.__setattr__(self, '_combined', saved_tensors)
+
+    @property
+    def saved_tensors(self):
+        return object.__getattribute__(self, '_combined')
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, '_real'), name)
+
+    def __setattr__(self, name, value):
+        if name in ('_real', '_combined'):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(object.__getattribute__(self, '_real'), name, value)
+
+
 def linear_with_grad_accum_backward_wrapper(fn):
     """Wrapper for LinearWithGradAccumulationAndAsyncCommunication.backward.
 
@@ -170,31 +191,5 @@ def linear_with_grad_accum_backward_wrapper(fn):
         weight = ctx.weight
         (input,) = ctx.saved_tensors  # only input was saved via save_for_backward
 
-        # saved_tensors is a C-level *data* descriptor (has __set__), which takes
-        # priority over instance __dict__, so we cannot shadow it with a plain
-        # instance attribute.  Use a shim object that exposes saved_tensors as a
-        # Python @property returning (input, weight).
-        _combined = (input, weight)
-
-        class _CtxShim:
-            """Minimal shim exposing saved_tensors as (input, weight)."""
-            __slots__ = ('_real',)
-
-            def __init__(self, real_ctx):
-                object.__setattr__(self, '_real', real_ctx)
-
-            @property
-            def saved_tensors(self):
-                return _combined
-
-            def __getattr__(self, name):
-                return getattr(object.__getattribute__(self, '_real'), name)
-
-            def __setattr__(self, name, value):
-                if name == '_real':
-                    object.__setattr__(self, name, value)
-                else:
-                    setattr(object.__getattribute__(self, '_real'), name, value)
-
-        return fn(_CtxShim(ctx), grad_output)
+        return fn(_LinearGradAccumulationContext(ctx, (input, weight)), grad_output)
     return wrapper

@@ -12,10 +12,12 @@ def gpt_model_forward_wrapper(original_forward):
 
     @wraps(original_forward)
     def wrapper(self, *args, **kwargs):
+        profiler = None
         if getattr(self.config, 'fine_grained_activation_offloading', False):
             from megatron.core import parallel_state
             from mindspeed.core.pipeline_parallel.adaptive_offload.fine_grained_activation_offload import (
                 fine_grained_offloading_init_chunk_handler,
+                get_adaptive_profiler,
             )
             vp_stage = parallel_state.get_virtual_pipeline_model_parallel_rank()
             fine_grained_offloading_init_chunk_handler(
@@ -23,7 +25,17 @@ def gpt_model_forward_wrapper(original_forward):
                 vp_stage=vp_stage,
                 min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
             )
-        return original_forward(self, *args, **kwargs)
+            profiler = get_adaptive_profiler()
+        if profiler is None:
+            return original_forward(self, *args, **kwargs)
+        token = object()
+        profiler.begin_microbatch(token)
+        try:
+            result = original_forward(self, *args, **kwargs)
+        except Exception:
+            profiler.track_microbatch_backward(token, None)
+            raise
+        return profiler.track_microbatch_backward(token, result)
 
     return wrapper
 
