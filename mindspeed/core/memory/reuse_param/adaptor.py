@@ -131,8 +131,7 @@ def reuse_buffer_single(self):
     for buffer in self.buffers:
         buffer_numel = buffer.param_data.numel()
         shard_res_and_buffer_model_param = torch.zeros(buffer_numel * 2, dtype=torch.bfloat16, device=buffer.param_data.device)
-        shard_main_param_int32_view_buffer = torch.empty(buffer_numel, dtype=torch.int32, device=buffer.param_data.device)
-        reuse_data_ptr(shard_main_param_int32_view_buffer, shard_res_and_buffer_model_param, 0)
+        shard_main_param_int32_view_buffer = shard_res_and_buffer_model_param.view(torch.int32)
         self.shard_main_param_res_buffers.append(shard_res_and_buffer_model_param)
         self.model_param_bucket_and_shard_main_param_int32_view_map[shard_res_and_buffer_model_param] = shard_main_param_int32_view_buffer
     for model_fp16_params_this_group, shard_fp32_from_float16_group in zip(
@@ -164,11 +163,9 @@ def reuse_buffer_dis(self, data_parallel_world_size):
         for bucket in buffer.buckets:
             self.bucket_num_group.append(bucket.param_data.numel())
             param_data_dp_numel = bucket.param_data.numel() // data_parallel_world_size
-            shard_main_param_int32_view_bucket = torch.empty(param_data_dp_numel, dtype=torch.int32, device=bucket.param_data.device)
-            reuse_data_ptr(
-                shard_main_param_int32_view_bucket,
-                buffer.param_data,
-                (bucket_res_numel * data_parallel_world_size) // 2 + max(0, data_parallel_rank - 1) * param_data_dp_numel // 2)
+            int32_offset = (bucket_res_numel * data_parallel_world_size) // 2 + max(0, data_parallel_rank - 1) * param_data_dp_numel // 2
+            shard_main_param_int32_view_bucket = buffer.param_data.view(torch.int32).narrow(
+                0, int32_offset, param_data_dp_numel)
             self.model_param_bucket_and_res_map[bucket.param_data] = self.shard_main_param_res_buffers[-1][bucket_res_numel: bucket_res_numel + param_data_dp_numel]
             self.model_param_bucket_and_shard_main_param_int32_view_map[bucket.param_data] = shard_main_param_int32_view_bucket
             bucket_res_numel += param_data_dp_numel
